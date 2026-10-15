@@ -92,9 +92,16 @@ describe("resolveChannel", () => {
     interruptImmuneTurnActive: false,
   }
 
-  test("the reviewer never starts a turn", () => {
-    for (const severity of ["blocker", "concern", "nit", undefined] as const) {
-      expect(resolveChannel({ ...base, streaming: false, severity })).toBe("preserve")
+  test("a settled session is woken only by a concern or blocker", () => {
+    expect(resolveChannel({ ...base, streaming: false, severity: "blocker" })).toBe("steer")
+    expect(resolveChannel({ ...base, streaming: false, severity: "concern" })).toBe("steer")
+    expect(resolveChannel({ ...base, streaming: false, severity: "nit" })).toBe("preserve")
+    expect(resolveChannel({ ...base, streaming: false, severity: undefined })).toBe("preserve")
+  })
+
+  test("the immune window never wakes a settled session", () => {
+    for (const severity of ["blocker", "concern"] as const) {
+      expect(resolveChannel({ streaming: false, interruptImmuneTurnActive: true, severity })).toBe("preserve")
     }
   })
 

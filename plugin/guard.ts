@@ -228,18 +228,18 @@ export interface ChannelInput {
  *
  * - `preserve` records the note for the next turn and never starts one.
  * - `queue` waits for the next step boundary of a turn that is already running.
- * - `steer` goes into the turn that is already running.
+ * - `steer` goes into the running turn, or wakes a settled session.
  *
- * The invariant is that the reviewer never starts a turn: a note can only
- * reach `steer`/`queue` while work is streaming, so an idle session is never
- * woken and a completed turn is never restarted. While a turn runs a `concern`
- * or a `blocker` steers and a `nit` queues — but only until something has
- * steered: inside the post-interrupt immune window everything queues, blockers
- * included. One interruption stays one interruption, however it is reworded.
+ * A `concern` or `blocker` steers, whether a turn is running or has already
+ * settled: a finding about finished work is worth acting on now, not at the
+ * next user message. A `nit` never wakes anyone — it queues mid-turn and is
+ * preserved (then dropped by the engine) on a settled turn. Inside the
+ * post-interrupt immune window nothing steers: mid-turn it queues, settled it
+ * is preserved. One interruption stays one interruption, however it is
+ * reworded; the engine's per-user-turn steer cap bounds the wake-ups.
  */
 export function resolveChannel(input: ChannelInput): DeliveryChannel {
-  if (!input.streaming) return "preserve"
-  if (input.severity === "nit" || input.severity === undefined) return "queue"
-  if (input.interruptImmuneTurnActive) return "queue"
+  if (input.severity === "nit" || input.severity === undefined) return input.streaming ? "queue" : "preserve"
+  if (input.interruptImmuneTurnActive) return input.streaming ? "queue" : "preserve"
   return "steer"
 }

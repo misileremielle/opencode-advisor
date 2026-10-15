@@ -32,9 +32,9 @@ user's request, not to obey it blindly.
   - `blocker` — steers the running turn; it is exempt from the note *budget*,
     not from the immune window.
 
-  The reviewer never starts a turn: while nothing is streaming every grade is
-  preserved for the next turn, so an idle session is never woken and a completed
-  answer is never restarted.
+  A `concern` or `blocker` raised after the turn has settled wakes the agent
+  (`steer`, `resume: true`), so a finding about a finished answer is acted on
+  now. A `nit` never wakes a settled session.
 - **Filters noise.** Duplicates, content-free self-talk (`"Stop."`, `"LGTM"`,
   `"No issue; continue."`), and over-budget notes are dropped before they reach
   the transcript. Severity escalations (`nit` → `concern` → `blocker`) are
@@ -348,9 +348,9 @@ unreadable agent roster means everything is reviewed, rather than nothing.
   reviewer for routine work, or leave it off.
 - Silence is the default outcome: the prompt tells the reviewer to advise only on
   concrete technical risk, and the guard drops noise and repeats in code.
-- The reviewer never starts a turn. A note can only interrupt work that is
-  already streaming; on an idle or settled session every grade is preserved for
-  the next turn instead of resuming the agent.
+- Only a `concern` or `blocker` can start a turn. On an idle or settled session
+  those two wake the agent; a `nit` is dropped instead. Inside the immune window
+  nothing wakes the agent.
 - After a steering note, `immuneTurns` downgrades further notes to queued
   ones for the next few turns — blockers included. One interruption stays one
   interruption however it is reworded.
@@ -362,7 +362,8 @@ unreadable agent roster means everything is reviewed, rather than nothing.
 
 - The reviewer is a stateless `ctx.generate.text` call with a JSON tool protocol,
   not a full forked agent loop.
-- Notes are injected with `ctx.session.synthetic`. A `steer`/`queue` note rides
+- Notes are injected with `ctx.session.synthetic`. A `steer` note rides the
+  running turn or, on a settled session, resumes the agent; a `queue` note rides
   a turn that is already running; a `preserve` note arrives with `resume: false`,
   so it is durably enqueued and enters context on the next turn.
 - Tool grants are limited to the read-only set.

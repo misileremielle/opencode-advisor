@@ -84,10 +84,16 @@ bunx tsc --noEmit     # both must be green before any commit
 
 ## Invariants — each is pinned by a test
 
-1. **The reviewer never starts a turn.** `resolveChannel` returns `preserve`
-   whenever the session is not streaming; only work already running can be
-   steered. This is the guard against the advisor driving the agent.
-   (`guard.test.ts`, `"a note never resumes an idle session"`.)
+1. **Only a concern or blocker wakes the agent.** A `concern` or `blocker` steers
+   with `resume: true` whether the turn is running or settled, so a finding about
+   finished work restarts the agent instead of waiting for the next user message
+   (user's decision, 2026-10-15; this reverses `1e3ce05`'s never-wake rule). A `nit`
+   never wakes: it queues mid-turn and is dropped on a settled turn (invariant 8).
+   Wake-ups are bounded: inside the immune window nothing steers (settled →
+   `preserve`), and past `MAX_STEERS_PER_USER_TURN` (4) a would-be steer is queued
+   with `resume: false`. (`guard.test.ts`, `"a settled session is woken only by a
+   concern or blocker"`; `engine.test.ts`, `"wake-ups on settled turns stop at the
+   per-turn steer cap"`.)
 2. **Advisories are never reviewed** — `isAdvisorMessage` filters them out of the delta.
 3. **Every review is bounded** — each pass sees the whole current turn (a one-step
    slice is partial evidence, and partial evidence produces false claims), notes are

@@ -46,7 +46,7 @@ const MUTATIONS: Mutation[] = [
     replace: '    .join("\\n")',
   },
   {
-    name: "a note may resume an idle session (never-resume broken)",
+    name: "a queued note may resume the agent (only steers may wake)",
     file: "plugin/engine.ts",
     find: 'resume: to === "steer",',
     replace: "resume: true,",

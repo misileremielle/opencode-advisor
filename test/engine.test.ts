@@ -124,7 +124,7 @@ const midwork: SessionMessage = {
 }
 
 describe("AdvisorEngine", () => {
-  test("preserves a concern as a visible note after a terminal answer", async () => {
+  test("a concern after a terminal answer wakes the agent", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"Off-by-one in foo.ts"}]}')
     const engine = new TestEngine(makeConfig(), host)
@@ -132,8 +132,8 @@ describe("AdvisorEngine", () => {
     await engine.review("s1", false)
 
     expect(host.injections).toHaveLength(1)
-    expect(host.injections[0]!.delivery).toBe("queue")
-    expect(host.injections[0]!.resume).toBe(false)
+    expect(host.injections[0]!.delivery).toBe("steer")
+    expect(host.injections[0]!.resume).toBe(true)
     expect(host.injections[0]!.text).toContain('severity="concern"')
     expect(host.injections[0]!.text).toContain("Off-by-one in foo.ts")
     expect(host.injections[0]!.metadata?.advisor).toBeDefined()
@@ -143,8 +143,11 @@ describe("AdvisorEngine", () => {
   test("a queued concern is hidden from the model when it arrives late; a blocker never is", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"Late concern"}]}')
+    // A failed wake falls back to queue, which is the late-arriving path.
+    host.injectFailures = 1
     const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
+    expect(host.injections[0]!.delivery).toBe("queue")
     const late = [{ id: "msg_1", role: "user", content: [{ type: "text", text: host.injections[0]!.text }] }]
     expect(engine.staleNotes.filter(late, Date.now() + 10 * 60_000)).toBe(1)
     engine.dispose()
@@ -482,7 +485,8 @@ describe("AdvisorEngine", () => {
     const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
     expect(host.injections).toHaveLength(1)
-    expect(host.injections[0]!.delivery).toBe("queue")
+    expect(host.injections[0]!.delivery).toBe("steer")
+    expect(host.injections[0]!.resume).toBe(true)
     engine.dispose()
   })
 
@@ -642,7 +646,7 @@ describe("AdvisorEngine", () => {
     engine.dispose()
   })
 
-  test("a note never resumes an idle session", async () => {
+  test("a blocker wakes an idle session", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"blocker","note":"Stop and fix the schema"}]}')
     const engine = new TestEngine(makeConfig(), host)
@@ -650,8 +654,35 @@ describe("AdvisorEngine", () => {
     await engine.review("s1", false)
 
     expect(host.injections).toHaveLength(1)
-    expect(host.injections[0]!.delivery).toBe("queue")
-    expect(host.injections[0]!.resume).toBe(false)
+    expect(host.injections[0]!.delivery).toBe("steer")
+    expect(host.injections[0]!.resume).toBe(true)
+    engine.dispose()
+  })
+
+  test("wake-ups on settled turns stop at the per-turn steer cap", async () => {
+    // Each woken run adds an assistant answer and no user message, so the cap
+    // is never reset by the advisor's own wake-ups.
+    const transcript: SessionMessage[] = [user, terminal]
+    const host = makeHost("/repo", transcript)
+    const findings = [
+      "The retry loop in fetch.ts never backs off",
+      "config.ts reads PORT before dotenv loads",
+      "Migration 7 drops the users index",
+      "The cache key ignores the locale header",
+      "Logger writes secrets from the auth payload",
+      "Test fixture leaks a temp directory per run",
+    ]
+    for (const note of findings) host.responses.push(JSON.stringify({ notes: [{ severity: "concern", note }] }))
+    const engine = new TestEngine(makeConfig({ immuneTurns: 0 }), host)
+
+    for (let i = 0; i < 6; i++) {
+      await engine.review("s1", false)
+      transcript.push({ id: `a${i}`, type: "assistant", finish: "stop", content: [{ type: "text", text: `answer ${i}` }] })
+    }
+
+    const wakes = host.injections.filter((inj) => inj.resume)
+    expect(wakes).toHaveLength(4)
+    expect(host.injections.slice(4).every((inj) => inj.delivery === "queue" && inj.resume === false)).toBe(true)
     engine.dispose()
   })
 
@@ -711,14 +742,14 @@ describe("AdvisorEngine", () => {
     engine.dispose()
   })
 
-  test("a preserved note on a settled turn also asks for a restatement", async () => {
+  test("a wake-up note on a settled turn also asks for a restatement", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"The port is wrong"}]}')
     const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", false)
 
-    expect(host.injections[0]!.resume).toBe(false)
+    expect(host.injections[0]!.resume).toBe(true)
     expect(host.injections[0]!.text).toContain("advisory-closeout")
     engine.dispose()
   })
