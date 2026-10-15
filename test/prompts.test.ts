@@ -1,108 +1,51 @@
 import { describe, expect, test } from "bun:test"
-import { buildAdvicePrompt, buildReviewPrompt, buildSystemPrompt, formatAdvisoryBatch, parseAdvisorReply } from "../plugin/prompts.ts"
+import { OMP_ADVISE_TOOL, OMP_BOUNDARY_GUIDANCE, OMP_SYSTEM, renderContextFiles, renderSystem } from "../plugin/omp-prompts.ts"
+import { BOUNDARY_GUIDANCE, buildSystemPrompt, formatAdvisoryBatch } from "../plugin/prompts.ts"
 
-describe("parseAdvisorReply", () => {
-  test("parses a notes response", () => {
-    const reply = parseAdvisorReply('{"notes":[{"severity":"concern","note":"x"}]}')
-    expect(reply.kind).toBe("notes")
-    expect(reply.notes).toEqual([{ severity: "concern", note: "x" }])
+describe("omp prompts", () => {
+  test("system.md renders its note budget, defaulting to omp's 4", () => {
+    expect(renderSystem(2)).toContain("max 2 non-blockers/update")
+    expect(renderSystem(undefined)).toContain("max 4 non-blockers/update")
+    expect(renderSystem(3)).not.toContain("{{")
   })
 
-  test("parses a tool request", () => {
-    const reply = parseAdvisorReply('{"tool":"grep","input":{"pattern":"foo","path":"src"}}')
-    expect(reply.kind).toBe("tool")
-    expect(reply.tool).toBe("grep")
-    expect(reply.input).toEqual({ pattern: "foo", path: "src" })
+  test("the verbatim prompts are omp's", () => {
+    expect(OMP_SYSTEM.startsWith("<conventions>")).toBe(true)
+    expect(OMP_SYSTEM).toContain("Default read-only: `read`, `grep`, `glob`")
+    expect(OMP_SYSTEM.trimEnd().endsWith("Offer better designs, not only warning.")).toBe(true)
+    expect(OMP_ADVISE_TOOL).toBe(
+      "Watched agent: send 1 concrete, terse advice.\nUse sparingly; stay silent when nothing matters.\nCall to avert likely-wrong or materially wasteful work.",
+    )
+    expect(OMP_BOUNDARY_GUIDANCE).toContain("aggregated review from other models")
   })
 
-  test("accepts a bare array or single note", () => {
-    expect(parseAdvisorReply('[{"note":"a"}]').notes).toEqual([{ note: "a", severity: undefined }])
-    expect(parseAdvisorReply('{"note":"b","severity":"nit"}').notes).toEqual([{ note: "b", severity: "nit" }])
-  })
-
-  test("tolerates prose and json fences around the object", () => {
-    const reply = parseAdvisorReply('Sure!\n```json\n{"notes":[{"note":"c"}]}\n```\n')
-    expect(reply.notes?.[0]?.note).toBe("c")
-  })
-
-  test("ignores unknown severities and empty notes", () => {
-    const reply = parseAdvisorReply('{"notes":[{"note":"d","severity":"catastrophe"},{"note":"  "}]}')
-    expect(reply.notes).toEqual([{ note: "d", severity: undefined }])
-  })
-
-  test("parses a silent retraction", () => {
-    const reply = parseAdvisorReply('{"retractions":["the earlier note"],"notes":[]}')
-    expect(reply.kind).toBe("notes")
-    expect(reply.notes).toEqual([])
-    expect(reply.retractions).toEqual(["the earlier note"])
-  })
-
-  test("flags unparseable output", () => {
-    expect(parseAdvisorReply("I have no idea").kind).toBe("invalid")
+  test("context-files.md renders each file inside omp's project-context framing", () => {
+    const block = renderContextFiles([
+      { path: "/r/AGENTS.md", content: "RULE ONE" },
+      { path: "/r/sub/AGENTS.md", content: "RULE TWO" },
+    ])!
+    expect(block.startsWith("<project-context>")).toBe(true)
+    expect(block).toContain("binding on driving agent")
+    expect(block).toContain('<file path="/r/AGENTS.md">\nRULE ONE\n</file>')
+    expect(block.indexOf("RULE ONE")).toBeLessThan(block.indexOf("RULE TWO"))
+    expect(block).not.toContain("{{")
+    expect(renderContextFiles([])).toBeUndefined()
   })
 })
 
 describe("buildSystemPrompt", () => {
-  test("forbids reviewing the review process", () => {
-    const system = buildSystemPrompt({ advisorName: "Advisor", maxNotes: 4, maxToolRounds: 6, watchdogBlocks: [] })
-    expect(system).toContain("NEVER review the review process")
-    expect(system).toContain("is not work to review")
-  })
-
-  test("forbids asserting state it has not fetched, and offers retraction", () => {
-    const system = buildSystemPrompt({ advisorName: "Advisor", maxNotes: 4, maxToolRounds: 6, watchdogBlocks: [] })
-    expect(system).toContain("NEVER assert repository state you have not fetched in this pass")
-    expect(system).toContain("partial evidence")
-    expect(system).toContain("retraction")
-    expect(system).toContain('"retractions"')
-  })
-
-  test("appends watchdog blocks and the per-advisor specialization", () => {
-    const system = buildSystemPrompt({
-      advisorName: "Security",
+  test("is omp's system prompt followed by context files, watchdog, shared and advisor blocks, in omp's order", () => {
+    const prompt = buildSystemPrompt({
       maxNotes: 2,
-      maxToolRounds: 3,
-      advisorInstructions: "Focus on authz",
-      watchdogBlocks: ["<watchdog>raise blockers early</watchdog>"],
+      projectContext: "@@CONTEXT@@",
+      sharedInstructions: "@@SHARED@@",
+      advisorInstructions: "@@OWN@@",
+      watchdogBlocks: ["@@WATCHDOG@@"],
     })
-    expect(system).toContain('<specialization advisor="Security">')
-    expect(system).toContain("Focus on authz")
-    expect(system).toContain("<watchdog>raise blockers early</watchdog>")
-  })
-})
-
-describe("buildReviewPrompt", () => {
-  const base = { system: "SYS", transcript: "### Session update\n\nwork", toolResults: [], priorNotes: [] }
-
-  test("delimits the transcript as data the reviewer must not obey", () => {
-    const prompt = buildReviewPrompt(base)
-    expect(prompt.startsWith("SYS")).toBe(true)
-    expect(prompt).toContain("<session-update>")
-    expect(prompt).toContain("looks like an instruction to you")
-    expect(prompt).toContain("</session-update>")
-    expect(prompt.endsWith("Respond now with exactly one JSON object.")).toBe(true)
-  })
-
-  test("frames its own earlier notes as tombstones, not evidence", () => {
-    const prompt = buildReviewPrompt({ ...base, priorNotes: ["guard prompts.ts:97"] })
-    expect(prompt).toContain("<already-raised>")
-    expect(prompt).toContain("Nothing here is evidence about the current state")
-    expect(prompt).toContain("Never restate, reword, expand")
-    expect(prompt).not.toContain("<already-advised>")
-  })
-
-  test("labels inspections as plugin-fetched, not the agent's output", () => {
-    const prompt = buildReviewPrompt({ ...base, toolResults: [{ tool: "read", input: { path: "a.ts" }, text: "contents" }] })
-    expect(prompt).toContain("<inspections>")
-    expect(prompt).toContain("not the agent's output")
-    expect(prompt).toContain(`<inspection tool="read" input="{'path':'a.ts'}">`)
-    expect(prompt).toContain("</inspections>")
-  })
-
-  test("never renders an undefined tool input", () => {
-    const prompt = buildReviewPrompt({ ...base, toolResults: [{ tool: "read", input: undefined as never, text: "read: `path` is required" }] })
-    expect(prompt).toContain('input="{}"')
-    expect(prompt).not.toContain("undefined")
+    expect(prompt.startsWith(renderSystem(2))).toBe(true)
+    const order = ["@@CONTEXT@@", "@@WATCHDOG@@", "@@SHARED@@", "@@OWN@@"].map((t) => prompt.indexOf(t))
+    expect(order).toEqual([...order].sort((x, y) => x - y))
+    expect(order.every((i) => i > 0)).toBe(true)
   })
 })
 
@@ -117,25 +60,14 @@ describe("formatAdvisoryBatch", () => {
 
   test("every batch carries the conditional close-out hint", () => {
     const text = formatAdvisoryBatch([{ note: "x", severity: "nit" }], "Advisor")
-    expect(text).toContain("<advisory-closeout>If you have already written a final answer")
+    expect(text).toContain("<advisory-closeout>If you have already written a final answer and this note changes it")
+    expect(text).toContain("never repost an unchanged answer")
     expect(text.endsWith("</advisory-closeout>")).toBe(true)
   })
-})
 
-describe("buildAdvicePrompt", () => {
-  test("frames the question over the transcript with the advice contract", () => {
-    const prompt = buildAdvicePrompt({ advisorName: "Advisor", transcript: "**User**\nmerge plan?", question: "which branch order" })
-    expect(prompt.indexOf("strategic advisor")).toBeLessThan(prompt.indexOf("CONVERSATION TRANSCRIPT"))
-    expect(prompt).toContain("**User**")
-    expect(prompt).toContain("--- QUESTION ---\n\nwhich branch order")
-    expect(prompt).toContain("under 300 words")
-    expect(prompt).toContain("Do NOT write code")
-  })
-
-  test("substitutes defaults for an empty question or transcript", () => {
-    const prompt = buildAdvicePrompt({ advisorName: "Scout", transcript: "   ", question: "  " })
-    expect(prompt).toContain("(no conversation yet)")
-    expect(prompt).toContain("advise on what to do next")
-    expect(prompt).toContain("You are Scout")
+  test("a boundary batch is prefaced by omp's boundary guidance", () => {
+    const text = formatAdvisoryBatch([{ note: "x", severity: "concern" }], "Advisor", { boundary: true })
+    expect(text.startsWith(BOUNDARY_GUIDANCE)).toBe(true)
+    expect(formatAdvisoryBatch([{ note: "x" }], "Advisor").includes(BOUNDARY_GUIDANCE)).toBe(false)
   })
 })

@@ -142,7 +142,6 @@ describe("resolveConfig", () => {
       const config = await resolveConfig({}, empty, empty)
       expect(config.enabled).toBe(false)
       expect(config.immuneTurns).toBe(3)
-      expect(config.maxToolRounds).toBe(3)
       // Prompt size drives reviewer latency, so the delta cap and the deadline
       // are chosen together (see the comment in resolveConfig).
       expect(config.maxTranscriptChars).toBe(30_000)

@@ -14,7 +14,7 @@
  * twice.
  */
 import { Plugin } from "@opencode/plugin"
-import { ADVISOR_TOOL_NAME, refreshProjectContext, resolveConfig, type AdvisorOptions } from "./config.ts"
+import { DEFAULT_TOOLS, resolveConfig, type AdvisorOptions } from "./config.ts"
 import { activeClaimCount, isClaimOwner, releaseClaim, writeClaim } from "./claims.ts"
 import { createContextLineHook } from "./context-line.ts"
 import { AdvisorEngine, type AdvisorEvent, type EngineHost, type ModelRef, type NotifyInput, type PersistedCounters } from "./engine.ts"
@@ -22,10 +22,32 @@ import { stamp } from "./format.ts"
 import { instanceClosed, instanceOpened } from "./instances.ts"
 import { matchModel, matchWithRefresh, type RegistryModel } from "./model.ts"
 import { NOTES_BASE, writeStatus } from "./notes-file.ts"
-import { ADVISOR_TOOL_DESCRIPTION } from "./prompts.ts"
+import { OMP_ADVISE_TOOL } from "./omp-prompts.ts"
+import { buildSystemPrompt } from "./prompts.ts"
 import type { SessionMessage } from "./transcript.ts"
 
 const AGENT_TOOL_SUFFIX = "/api/openchamber/agent-tool"
+
+/** omp's advisor tool; only advisor agents may call it. */
+const ADVISE_TOOL = "advise"
+
+/** The hidden agent that runs one roster entry's reviews. */
+export function advisorAgentID(slug: string): string {
+  return `advisor-${slug}`
+}
+
+/**
+ * What an advisor may do: deny everything, then allow only its granted
+ * read-only tools and `advise`. Rules are last-match-wins and a wholly denied
+ * tool is dropped from the tool list, so this also turns off edit, shell, web,
+ * external directories and code mode for it.
+ */
+export function advisorPermissions(granted: readonly string[]): { action: string; resource: string; effect: "allow" | "deny" }[] {
+  return [
+    { action: "*", resource: "*", effect: "deny" },
+    ...[...granted, ADVISE_TOOL].map((action) => ({ action, resource: "*", effect: "allow" as const })),
+  ]
+}
 
 /**
  * Base URL for OpenChamber's server, derived from the agent-tool callback URL.
@@ -123,10 +145,43 @@ export default Plugin.define({
         const messages = await ctx.session.context({ sessionID })
         return messages as unknown as SessionMessage[]
       },
-      async generate({ model, prompt, signal }) {
-        const input = model ? { prompt, model } : { prompt }
-        const result = await ctx.generate.text(input, { signal } as never)
-        return result.text
+      async createAdvisorSession({ parentID, advisor, model }) {
+        const session = await ctx.session.create({
+          parentID: parentID as never,
+          agent: advisorAgentID(advisor.slug) as never,
+          title: `Advisor: ${advisor.name}`,
+          // Also on the session: OpenCode appends the config's global
+          // `permissions` (often a `*` allow) after every agent's own rules, and
+          // session rules are merged last, so only here is the deny-all final.
+          permissions: advisorPermissions(advisor.tools ?? [...DEFAULT_TOOLS]) as never,
+          ...(model ? { model: { providerID: model.providerID, id: model.id, ...(model.variant ? { variant: model.variant } : {}) } as never } : {}),
+          location: { directory },
+        })
+        return session.id as string
+      },
+      async runAdvisor({ advisorSessionID, text, signal }) {
+        const sessionID = advisorSessionID as never
+        // `prompt` admits the message and wakes the run before it returns, so
+        // `wait` sees the execution and resolves only once it has settled.
+        const admitted = await ctx.session.prompt({ sessionID, text, metadata: { advisor: { kind: "update" } } })
+        const onAbort = () => {
+          void ctx.session.interrupt({ sessionID }).catch(() => {})
+        }
+        signal.addEventListener("abort", onAbort, { once: true })
+        try {
+          await ctx.session.wait({ sessionID })
+        } finally {
+          signal.removeEventListener("abort", onAbort)
+        }
+        if (signal.aborted) return { ok: false, error: "aborted" }
+        const messages = (await ctx.session.context({ sessionID })) as unknown as SessionMessage[]
+        const start = messages.findIndex((m) => m.id === admitted.id)
+        const replies = messages.slice(start + 1).filter((m) => m.type === "assistant")
+        const last = replies.at(-1)
+        if (!last) return { ok: false, error: "the advisor produced no reply" }
+        if (last.error) return { ok: false, error: last.error.message ?? last.error.type ?? "the advisor's run failed" }
+        if (last.finish === "error") return { ok: false, error: "the advisor's run ended with an error" }
+        return { ok: true }
       },
       async inject({ sessionID, text, description, metadata, delivery, resume }) {
         const message = await ctx.session.synthetic({ sessionID, text, description, metadata: metadata as never, delivery, resume })
@@ -209,6 +264,11 @@ export default Plugin.define({
       notify(input) {
         void postNotification(input).catch((err) => console.warn(`[advisor] notification failed: ${(err as Error).message}`))
       },
+      async interrupt(sessionID) {
+        // Resolves once the interruption is accepted; cleanup settles in the
+        // execution fiber, so this does not wait on the hook that called it.
+        await ctx.session.interrupt({ sessionID: sessionID as never })
+      },
       persistCounters(sessionID, next) {
         counters[sessionID] = next
         const keys = Object.keys(counters)
@@ -217,12 +277,70 @@ export default Plugin.define({
           .set(countersKey, counters as never)
           .catch((err) => console.warn(`[advisor] failed to persist counters: ${(err as Error).message}`))
       },
-      async refreshContext() {
-        return refreshProjectContext(directory)
-      },
     }
 
     const engine = new AdvisorEngine(config, host)
+
+    // The advisor is a real agent, as omp's is: one hidden agent per roster
+    // entry, with omp's system prompt and only its granted read-only tools plus
+    // `advise`. The same rules are set again on each advisor session, where they
+    // are final (see createAdvisorSession).
+    try {
+      await ctx.agent.transform((editor) => {
+        for (const advisor of config.advisors) {
+          editor.update(advisorAgentID(advisor.slug), (draft) => {
+            draft.description = `Advisor reviewer: ${advisor.name}`
+            draft.mode = "subagent"
+            draft.hidden = true
+            draft.system = buildSystemPrompt({
+              maxNotes: advisor.maxNotesPerUpdate ?? config.sharedMaxNotesPerUpdate,
+              projectContext: config.projectContext,
+              sharedInstructions: config.sharedInstructions,
+              advisorInstructions: advisor.instructions,
+              watchdogBlocks: config.watchdogBlocks,
+            })
+            draft.permissions = advisorPermissions(advisor.tools ?? [...DEFAULT_TOOLS]) as never
+          })
+        }
+      })
+    } catch (err) {
+      console.warn(`[advisor] advisor agent registration failed: ${(err as Error).message}`)
+    }
+
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: ADVISE_TOOL,
+        description: OMP_ADVISE_TOOL,
+        // A direct tool, like read/grep/glob: the advisor has code mode denied,
+        // so a code-mode tool would be unreachable for it.
+        options: { codemode: false },
+        input: {
+          type: "object",
+          properties: {
+            note: {
+              type: "string",
+              description: "One concrete piece of advice for the agent you are watching. Terse, specific, actionable.",
+            },
+            severity: {
+              type: "string",
+              enum: ["nit", "concern", "blocker"],
+              description: "How strongly to weigh this. Omit for a plain nit.",
+            },
+          },
+          required: ["note"],
+        },
+        async execute(input: unknown, context: { sessionID: string }) {
+          // The context hook removes the tool from every other session's
+          // request; this guards one it could not (for example, a session from
+          // before a reload).
+          if (!engine.isAdvisorSession(context.sessionID)) {
+            return { content: "Dropped: advise is only available inside a live advisor review." }
+          }
+          return { content: await engine.advise(context.sessionID, (input ?? {}) as { note?: unknown; severity?: unknown }) }
+        },
+      } as never)
+    })
+
     // Claim reviewing for this directory. A second server, or an instance from
     // a reload that has not been disposed, loses to the newer claim instead of
     // reviewing the same sessions with its own state.
@@ -249,37 +367,34 @@ export default Plugin.define({
       }
     }
 
-    // Pull-mode advice: an `advisor` tool the agent can call. The answer is the
-    // tool's own result, which renders in OpenChamber's timeline — the one
-    // channel for plugin advice that does not depend on OpenChamber rendering
-    // synthetics. Gated per session like the pushed reviewer.
-    await ctx.tool.transform((editor) => {
-      editor.add({
-        name: ADVISOR_TOOL_NAME,
-        description: ADVISOR_TOOL_DESCRIPTION,
-        // `pinned` is meant to keep a tool in front of the model rather than
-        // leaving it optional. Its effect is unverified: the schema types it
-        // only alongside `codemode`, and the OpenCode checkout has no consumer
-        // for it, so this may be inert. Harmless either way — the description
-        // and the project's own AGENTS.md are the levers that certainly work.
-        options: { pinned: true },
-        input: {
-          type: "object",
-          properties: {
-            question: {
-              type: "string",
-              description:
-                "Optional focus, e.g. 'merge strategy for the test branch'. Omit for general next-step advice.",
-            },
-          },
-        },
-        async execute(input, context) {
-          const question = (input as { question?: unknown } | undefined)?.question
-          const text = await engine.pullAdvice(context.sessionID, typeof question === "string" ? question : "")
-          return { content: text }
-        },
-      })
-    })
+    // Catch-up: OpenCode awaits `"context"` hooks before every primary model
+    // request (PluginHooks.trigger runs each callback in turn, and the promise
+    // adapter wraps it in Effect.promise), so holding this promise pauses the
+    // agent until the reviewer has caught up. Advice is push-only: there is no
+    // pull-mode `advisor` tool.
+    try {
+      await ctx.session.hook("context", (async (draft: { sessionID?: unknown; tools?: Record<string, unknown>; messages?: unknown }) => {
+        if (typeof draft?.sessionID !== "string") return
+        // `advise` is the advisor's alone. Plugin tools are global and the
+        // config's permissions are appended after any plugin rule, so the tool
+        // is taken out of every other request here; a tool missing from the
+        // hooked draft is neither offered nor callable.
+        if (draft.tools && !engine.isAdvisorSession(draft.sessionID)) delete draft.tools[ADVISE_TOOL]
+        // Queued notes that reached the model late are hidden from it (stale.ts).
+        try {
+          if (!engine.isAdvisorSession(draft.sessionID)) engine.staleNotes.filter(draft.messages)
+        } catch (err) {
+          console.warn(`[advisor] stale-note filter failed: ${(err as Error).message}`)
+        }
+        try {
+          await engine.catchUp(draft.sessionID)
+        } catch (err) {
+          console.warn(`[advisor] catch-up wait failed: ${(err as Error).message}`)
+        }
+      }) as never)
+    } catch (err) {
+      console.warn(`[advisor] catch-up hook registration failed: ${(err as Error).message}`)
+    }
 
     try {
       const storedCounters = await ctx.storage.get(countersKey)
@@ -366,6 +481,7 @@ export default Plugin.define({
             }
             lines.push(
               `Reviews ${status.reviews} · delivered ${status.notesDelivered} · backlog ${status.backlog}` +
+                ` · unreviewed steps ${status.unreviewedSteps}${status.catchingUp ? " (agent waiting for catch-up)" : ""}` +
                 (status.lastReviewAt
                   ? ` · last ${stamp(status.lastReviewAt)} (${status.lastOutcome ?? `${status.lastNoteCount} notes`})`
                   : " · no review yet"),

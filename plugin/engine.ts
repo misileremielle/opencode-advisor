@@ -5,27 +5,25 @@
  * Observation is pull-based. The engine subscribes to the event stream only as
  * a trigger (`session.idle`, `session.step.ended`, ...); when triggered it reads
  * the authoritative transcript with `ctx.session.context` and reviews the current
- * turn from its start, so a mid-turn pass is never reasoning off one step. The
- * reviewer itself is a stateless `ctx.generate.text`
- * call with a small JSON protocol, so it can request `read`/`grep`/`glob` before
- * advising without ever mutating the session or the repository.
+ * update since the last review. The reviewer is a real OpenCode agent with its
+ * own persistent session (a child of the primary), omp's prompt, and only
+ * `read`/`grep`/`glob`/`advise`, so it verifies with real tool calls and keeps
+ * its own context across reviews, as omp's advisor does.
  */
 import {
   EmissionGuard,
-  isSameNote,
   resolveChannel,
   severityRank,
   type DeliveryChannel,
   type Note,
   type Severity,
 } from "./guard.ts"
-import { buildAdvicePrompt, buildReviewPrompt, buildSystemPrompt, formatAdvisoryBatch, parseAdvisorReply } from "./prompts.ts"
+import { formatAdvisoryBatch } from "./prompts.ts"
+import { StaleNoteFilter } from "./stale.ts"
 import type { AdvisorConfig, AdvisorSpec } from "./config.ts"
-import { DEFAULT_TOOLS } from "./config.ts"
 import { renderDelta, type SessionMessage } from "./transcript.ts"
 import { appendNote, NOTES_BASE } from "./notes-file.ts"
 import { liveInstances } from "./instances.ts"
-import { runTool } from "./tools.ts"
 import { parseSelector, type ModelRef } from "./model.ts"
 
 export { parseSelector, type ModelRef } from "./model.ts"
@@ -53,7 +51,13 @@ export interface EngineHost {
   /** Identifies this plugin instance in status output and injected metadata. */
   instance?: string
   listMessages(sessionID: string): Promise<SessionMessage[]>
-  generate(input: { model?: ModelRef; prompt: string; signal: AbortSignal }): Promise<string>
+  /** Open the advisor's persistent session as a child of the primary session. */
+  createAdvisorSession(input: { parentID: string; advisor: AdvisorSpec; model?: ModelRef }): Promise<string>
+  /**
+   * Send one transcript update to an advisor session and wait for its run to
+   * settle. `ok: false` means the run errored; aborting `signal` must stop it.
+   */
+  runAdvisor(input: { advisorSessionID: string; text: string; signal: AbortSignal }): Promise<AdvisorRunResult>
   inject(input: InjectInput): Promise<string | undefined>
   /** Resolve a `provider/model#variant` selector (or the default) to a usable model. */
   resolveModel(selector: string | undefined): Promise<ModelRef | undefined>
@@ -65,16 +69,29 @@ export interface EngineHost {
   onSessionOverride?(sessionID: string, enabled: boolean | undefined): Promise<void> | void
   /** Persist review counters so /advisor status survives a plugin reload. */
   persistCounters?(sessionID: string, counters: PersistedCounters): void
-  /**
-   * Re-read the project's on-disk context (AGENTS.md, WATCHDOG.md) so a doc edit
-   * reaches the reviewer without waiting for the plugin to reload.
-   */
-  refreshContext?(): Promise<{ projectContext?: string; watchdogBlocks: string[]; warnings?: string[] } | undefined>
   /** Raise a user-facing notification (OpenChamber only; a no-op elsewhere). */
   notify?(input: NotifyInput): void
+  /** Stop the session's running turn (`ctx.session.interrupt`). */
+  interrupt?(sessionID: string): Promise<void>
+
   /** Whether this instance still owns reviewing for its directory. */
   isClaimOwner?: () => boolean
   log(level: "debug" | "warn", message: string, data?: Record<string, unknown>): void
+}
+
+export type AdvisorRunResult = { ok: true } | { ok: false; error: string }
+
+/** A review in flight, so the `advise` tool can route its notes. */
+interface ActivePass {
+  advisor: AdvisorSpec
+  sessionID: string
+  streaming: boolean
+  state: SessionState
+  guard: EmissionGuard
+  /** Non-blocker notes raised mid-turn, delivered when the run settles. */
+  deferred: Note[]
+  raised: number
+  routed: number
 }
 
 export interface NotifyInput {
@@ -134,6 +151,23 @@ interface SessionState {
   lastModelWarning?: string
   /** Failure notices already delivered, so a broken reviewer is loud once. */
   noticesSent: Set<string>
+  /** Primary steps that have ended (`session.step.ended`). */
+  stepsEnded: number
+  /** Steps covered by a review pass that completed without failing. */
+  reviewedSteps: number
+  /** Whether the current review pass failed (model error, unparseable reply, or a throw). */
+  passFailed: boolean
+  /** Set while the primary is held in the context hook until the reviewer catches up. */
+  catchUp?: CatchUp
+  /** Completed turn at which the boundary guidance was last shown. */
+  boundaryGuidanceTurn?: number
+}
+
+interface CatchUp {
+  promise: Promise<void>
+  release: () => void
+  /** Failed passes since the wait began. */
+  failures: number
 }
 
 const DEBOUNCE_MS = 350
@@ -143,46 +177,22 @@ const MIDTURN_MIN_INTERVAL_MS = 30_000
 /** Ceiling on delivered blockers per user turn: past this a blocker is far more
  *  likely to be churn than signal, and the turn-end pass can re-raise it. */
 const MAX_BLOCKERS_PER_USER_TURN = 2
-/**
- * How long a freshly-read project context is reused. Long enough that a burst of
- * step-boundary reviews costs one read, short enough that editing AGENTS.md is
- * reflected within seconds rather than at the next plugin reload.
- */
-const CONTEXT_TTL_MS = 10_000
-/** Attempts per reviewer model call: one retry for a fast transient failure. */
-const MAX_MODEL_ATTEMPTS = 2
-/**
- * Failures worth one retry: the request never produced a usable answer for a
- * transport reason. Auth, model-resolution and configuration failures are
- * deliberately absent — retrying those only spends time to fail again.
- */
-const TRANSIENT_FAILURE = /ECONN|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|getaddrinfo|network|stream ended|streaming response failed|finish_reason|premature close|connection (lost|reset|closed)|provider closed the stream|completion marker|mid-stream|fetch failed|upstream service timeout|server_error|overloaded|service unavailable|internal server error|bad gateway|gateway timeout|\b(429|502|503|504)\b/i
-
-function isTransientFailure(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  return TRANSIENT_FAILURE.test(message)
-}
-
-/**
- * Say what was attempted, so a failure notice is decodable on its own.
- *
- * "upstream service timeout" is ambiguous: it is the same text whether the
- * plugin is running a build that retries and lost both attempts, or one that
- * never retried at all. Naming the attempt count and the first failure removes
- * that ambiguity from every future occurrence.
- */
-function describeFailure(error: unknown, attempts: number, firstError: unknown): string {
-  const message = error instanceof Error ? error.message : String(error)
-  if (attempts <= 1) return `${message} (one attempt; not retried: not a transient failure)`
-  const first = firstError instanceof Error ? firstError.message : String(firstError)
-  return `${message} (${attempts} attempts; first failure: ${first})`
-}
 /** How long a session's reviewability verdict is trusted. */
 const SESSION_FILTER_TTL_MS = 5 * 60_000
 const PRIOR_NOTE_LIMIT = 40
 /** Safety net: at most this many steering wake-ups per user turn, so a
  *  confused reviewer cannot loop the primary indefinitely. */
 const MAX_STEERS_PER_USER_TURN = 4
+/**
+ * Reviews run in the background until this many primary steps are unreviewed.
+ * From then on the primary's next model request waits — with no time cap —
+ * until every step has been reviewed.
+ */
+const CATCH_UP_THRESHOLD = 5
+/** Failed passes retried during a catch-up wait before the primary is stopped. */
+const CATCH_UP_RETRIES = 3
+/** omp's cadence for repeating the boundary guidance header. */
+const BOUNDARY_GUIDANCE_TURNS = 50
 
 function resolvedDirectory(directory: string | undefined): string | undefined {
   return directory ? directory.replace(/\/+$/, "") : undefined
@@ -196,8 +206,14 @@ export class AdvisorEngine {
   #sessionOrder: string[] = []
   #reviewable = new Map<string, { ok: boolean; at: number }>()
   #agents?: { at: number; reviewable?: Set<string> }
-  /** Sessions with a pull-tool answer in flight, one at a time. */
-  #pullsInFlight = new Set<string>()
+  /** Advisor runs in flight, by advisor session, so `advise` knows where a note belongs. */
+  #activePasses = new Map<string, ActivePass>()
+  /** Advisor session per primary session and advisor slug. */
+  #advisorSessions = new Map<string, string>()
+  /** Every advisor session this engine opened. */
+  #advisorSessionIDs = new Set<string>()
+  /** Queued notes that are hidden from the model if they reach it late. */
+  readonly staleNotes = new StaleNoteFilter()
 
   constructor(config: AdvisorConfig, host: EngineHost) {
     this.#config = config
@@ -233,6 +249,9 @@ export class AdvisorEngine {
         steersSinceUser: 0,
         blockersThisUserTurn: 0,
         noticesSent: new Set<string>(),
+        stepsEnded: 0,
+        reviewedSteps: 0,
+        passFailed: false,
       }
       this.#sessions.set(sessionID, state)
       this.#sessionOrder.push(sessionID)
@@ -283,39 +302,6 @@ export class AdvisorEngine {
   }
 
   /**
-   * The project context to review against, read from disk on a short TTL. An
-   * instance that loaded before a doc edit would otherwise keep asserting the
-   * superseded text — which is how a retired "124 tests" figure reached the user.
-   */
-  async #projectContext(): Promise<{ projectContext?: string; watchdogBlocks: string[] }> {
-    const fallback = { projectContext: this.#config.projectContext, watchdogBlocks: this.#config.watchdogBlocks }
-    if (!this.#host.refreshContext) return fallback
-    const now = Date.now()
-    if (this.#contextCache && now - this.#contextCache.at < CONTEXT_TTL_MS) return this.#contextCache.value
-    try {
-      const fresh = await this.#host.refreshContext()
-      if (fresh) {
-        this.#contextCache = { at: now, value: fresh }
-        const warning = (fresh.warnings ?? []).join("; ")
-        if (warning && warning !== this.#contextWarned) {
-          this.#contextWarned = warning
-          this.#host.log("warn", "advisor project context has warnings", { warning })
-        }
-        return fresh
-      }
-    } catch (err) {
-      this.#host.log("warn", "advisor context refresh failed", { error: (err as Error).message })
-    }
-    this.#contextCache = { at: now, value: fallback }
-    return fallback
-  }
-
-  /** Cached result of the last on-disk context read. */
-  #contextCache?: { at: number; value: { projectContext?: string; watchdogBlocks: string[]; warnings?: string[] } }
-  /** Last logged context warning, so a malformed file is reported once, not every review. */
-  #contextWarned?: string
-
-  /**
    * Restore review counters persisted before a reload. Deliberately excludes
    * `reviewedCount`: which transcript slice has been seen is per instance, and
    * a fresh instance should re-read the current turn rather than skip it.
@@ -342,9 +328,13 @@ export class AdvisorEngine {
   }
 
   setSessionEnabled(sessionID: string, enabled: boolean | undefined, persist = true): boolean {
-    this.#state(sessionID).enabled = enabled
+    const state = this.#state(sessionID)
+    state.enabled = enabled
     if (persist) void this.#host.onSessionOverride?.(sessionID, enabled)
-    return this.#isEnabled(sessionID)
+    const active = this.#isEnabled(sessionID)
+    // Turning the advisor off is also the user's way out of a catch-up wait.
+    if (!active) this.#releaseCatchUp(state, "advisor disabled")
+    return active
   }
 
   toggleSession(sessionID: string): boolean {
@@ -359,6 +349,8 @@ export class AdvisorEngine {
     const type = event.type
     const sessionID = typeof event.data?.sessionID === "string" ? (event.data.sessionID as string) : undefined
     if (!type || !sessionID) return
+    // The advisor's own runs are not work to review.
+    if (this.#advisorSessionIDs.has(sessionID)) return
 
     const directory = resolvedDirectory(event.location?.directory)
     if (directory && resolvedDirectory(this.#host.directory) && directory !== resolvedDirectory(this.#host.directory)) return
@@ -371,6 +363,7 @@ export class AdvisorEngine {
         return
       }
       case "session.step.ended": {
+        state.stepsEnded += 1
         const finish = typeof event.data?.finish === "string" ? event.data.finish : undefined
         // A step that ended with tool calls is mid-run; anything else yields.
         state.streaming = finish === "tool-calls"
@@ -390,6 +383,7 @@ export class AdvisorEngine {
       }
       case "session.execution.interrupted": {
         state.streaming = false
+        this.#releaseCatchUp(state, "turn interrupted")
         return
       }
       case "session.idle": {
@@ -479,15 +473,15 @@ export class AdvisorEngine {
     // directory is newer, and two reviewers means two sets of state, two
     // budgets and duplicate notes. Stay quiet and let the owner work.
     if (this.#host.isClaimOwner && !this.#host.isClaimOwner()) {
-      state.backlog = 0
+      this.#skipReview(state, "not the review owner")
       return
     }
     if (!(await this.#isReviewable(sessionID))) {
-      state.backlog = 0
+      this.#skipReview(state, "session not reviewable")
       return
     }
     if (!this.#isEnabled(sessionID)) {
-      state.backlog = 0
+      this.#skipReview(state, "advisor disabled")
       return
     }
     if (state.reviewInProgress) {
@@ -495,6 +489,12 @@ export class AdvisorEngine {
       return
     }
     state.reviewInProgress = true
+    state.passFailed = false
+    // Steps that ended before this pass read the transcript are the ones it covers.
+    const stepsAtStart = state.stepsEnded
+    // Where the reviewed cursor stood before this pass, so a failed pass leaves
+    // its slice unreviewed and a retry reads it again.
+    let rollback: number | undefined
     try {
       const messages = await this.#host.listMessages(sessionID)
       state.streaming = streaming
@@ -516,16 +516,14 @@ export class AdvisorEngine {
         if (lastUser < 0) return
       }
 
-      // Ground the pass in the whole current turn, not just the step that
-      // triggered it: a one-step slice is partial evidence, and reviewers that
-      // reason from it assert state they have not checked.
-      const lastUser = findLastIndex(messages, (m) => m.type === "user")
-      const base = lastUser >= 0 ? Math.min(state.reviewedCount, lastUser) : state.reviewedCount
-      const transcript = renderDelta(messages.slice(base), {
+      // Incremental, as omp's is: the advisor keeps its own session, so it
+      // already holds everything before the last reviewed message.
+      const transcript = renderDelta(messages.slice(state.reviewedCount), {
         includeThinking: this.#config.includeThinking,
         maxChars: this.#config.maxTranscriptChars,
         wip: streaming,
       })
+      rollback = state.reviewedCount
       state.reviewedCount = messages.length
       if (!transcript) return
 
@@ -549,11 +547,17 @@ export class AdvisorEngine {
         state.lastOutcome = "aborted"
         return
       }
+      state.passFailed = true
       state.lastError = (err as Error).message
       this.#host.log("warn", "advisor review failed", { sessionID, error: (err as Error).message })
     } finally {
       state.reviewInProgress = false
       state.backlog = Math.max(0, state.backlog - 1)
+      if (state.passFailed) {
+        if (rollback !== undefined) state.reviewedCount = rollback
+      } else if (!this.#abort.signal.aborted) {
+        state.reviewedSteps = Math.max(state.reviewedSteps, stepsAtStart)
+      }
       // Persisted here rather than on the success path so a failed pass is
       // remembered too: /advisor status should survive a reload with the same
       // numbers, and a failure that vanishes on reload reads as "never ran".
@@ -566,9 +570,17 @@ export class AdvisorEngine {
       if (queued) {
         scheduleMicrotask(() => void this.review(sessionID, queued.streaming))
       }
+      this.#afterPass(sessionID, state, queued !== null)
     }
   }
 
+  /**
+   * One review by one advisor: the transcript update goes to the advisor's own
+   * persistent session as its next user message, and the advisor works it like
+   * any OpenCode agent — `read`/`grep`/`glob` to verify, `advise` to speak.
+   * Notes arrive through {@link advise} while the run is live; this returns the
+   * number delivered once the run settles.
+   */
   async #reviewWith(
     advisor: AdvisorSpec,
     sessionID: string,
@@ -588,87 +600,243 @@ export class AdvisorEngine {
     state.guards.set(advisor.slug, guard)
     guard.beginUpdate()
 
-    const prior = state.priorNotes.get(advisor.slug) ?? []
-    const context = await this.#projectContext()
-    const system = buildSystemPrompt({
-      advisorName: advisor.name,
-      maxNotes: advisor.maxNotesPerUpdate ?? this.#config.sharedMaxNotesPerUpdate ?? 4,
-      maxToolRounds: this.#config.maxToolRounds,
-      sharedInstructions: this.#config.sharedInstructions,
-      advisorInstructions: advisor.instructions,
-      watchdogBlocks: context.watchdogBlocks,
-      projectContext: context.projectContext,
-    })
-
-    const granted = advisor.tools === undefined ? [...DEFAULT_TOOLS] : advisor.tools
-    const toolResults: { tool: string; input: Record<string, unknown>; text: string }[] = []
-
-    for (let round = 0; ; round++) {
-      if (this.#abort.signal.aborted) {
-        state.lastOutcome = "aborted"
-        return 0
-      }
-      const prompt = buildReviewPrompt({ system, transcript, toolResults, priorNotes: prior.slice(-PRIOR_NOTE_LIMIT) })
-      let text: string
-      try {
-        text = await this.#callModel(advisor, model, prompt)
-      } catch (err) {
-        // Our own abort means this instance is shutting down: a reload or a
-        // dispose cancelled the call mid-flight, and the SDK reports that as a
-        // transport error. That is not the endpoint failing, and paging the user
-        // about our own shutdown makes every plugin edit look like an outage.
-        if (this.#abort.signal.aborted) {
-          state.lastOutcome = "aborted"
-          return 0
-        }
-        const message = (err as Error).message
-        state.lastError = message
-        this.#host.log("warn", "advisor model call failed", { advisor: advisor.name, error: message })
-        state.lastOutcome = "model error"
-        await this.#noticeOnce(
-          state,
-          sessionID,
-          `error:${message}`,
-          `Advisor: the reviewer's model call failed (${message}), so this session is getting no advice. /advisor status has the details.`,
-        )
-        return 0
-      }
-      const reply = parseAdvisorReply(text)
-      if (reply.kind === "tool" && reply.tool) {
-        if (round >= this.#config.maxToolRounds) {
-          this.#host.log("debug", "advisor exceeded tool round budget", { advisor: advisor.name })
-          state.lastOutcome = "tool budget exhausted"
-          return 0
-        }
-        const outcome = await runTool(this.#host.directory, reply.tool, reply.input ?? {}, granted)
-        toolResults.push({ tool: reply.tool, input: reply.input ?? {}, text: outcome.text })
-        continue
-      }
-      if (reply.kind === "notes" && reply.notes) {
-        if (reply.retractions?.length) this.#applyRetractions(advisor, reply.retractions, state)
-        const routed = await this.#routeNotes(
-          advisor,
-          reply.notes,
-          sessionID,
-          streaming,
-          state,
-          guard,
-        )
-        const count = reply.notes.length === 0 ? "no notes" : `${reply.notes.length} notes`
-        // Mid-turn the reviewer is instructed to withhold non-blocking critique,
-        // so "no notes (in progress)" is expected, not a clean bill of health.
-        state.lastOutcome = streaming ? `${count} (in progress)` : count
-        return routed
-      }
-      // Kept, not just counted: a reviewer that answers outside the protocol is
-      // undiagnosable from a label alone, and the log is not persisted, so the
-      // excerpt goes where the user will actually see it — /advisor status.
-      const excerpt = reply.raw.replace(/\s+/g, " ").trim().slice(0, 200) || "(empty reply)"
-      this.#host.log("debug", "advisor returned an unparseable reply", { advisor: advisor.name, excerpt })
-      state.lastError = `unparseable reply: ${excerpt}`
-      state.lastOutcome = "unparseable reply"
+    const fail = async (message: string): Promise<number> => {
+      state.lastError = message
+      state.passFailed = true
+      state.lastOutcome = "advisor error"
+      this.#host.log("warn", "advisor run failed", { advisor: advisor.name, error: message })
+      await this.#noticeOnce(
+        state,
+        sessionID,
+        `error:${message}`,
+        `Advisor: the reviewer's run failed (${message}), so this session is getting no advice. /advisor status has the details.`,
+      )
       return 0
     }
+
+    let advisorSessionID: string
+    try {
+      advisorSessionID = await this.#advisorSession(sessionID, advisor, model)
+    } catch (err) {
+      if (this.#abort.signal.aborted) return 0
+      return fail(`could not open the advisor session: ${(err as Error).message}`)
+    }
+
+    const pass: ActivePass = { advisor, sessionID, streaming, state, guard, deferred: [], raised: 0, routed: 0 }
+    this.#activePasses.set(advisorSessionID, pass)
+    let result: AdvisorRunResult
+    try {
+      result = await this.#runAdvisor(advisorSessionID, transcript)
+    } finally {
+      this.#activePasses.delete(advisorSessionID)
+    }
+    if (this.#abort.signal.aborted) {
+      state.lastOutcome = "aborted"
+      return pass.routed
+    }
+    // Withheld mid-turn notes are delivered once the advisor's run settles,
+    // as omp flushes its deferred notes at the end of the update.
+    if (pass.deferred.length > 0) {
+      pass.routed += await this.#routeNotes(advisor, pass.deferred, sessionID, streaming, state, guard)
+    }
+    if (!result.ok) {
+      await fail(result.error)
+      return pass.routed
+    }
+    const count = pass.raised === 0 ? "no notes" : `${pass.raised} notes`
+    // Mid-turn the reviewer is instructed to withhold non-blocking critique,
+    // so "no notes (in progress)" is expected, not a clean bill of health.
+    state.lastOutcome = streaming ? `${count} (in progress)` : count
+    return pass.routed
+  }
+
+  /** The advisor's persistent session for this primary session, created on first use. */
+  async #advisorSession(sessionID: string, advisor: AdvisorSpec, model: ModelRef | undefined): Promise<string> {
+    const key = `${sessionID}\u0000${advisor.slug}`
+    const known = this.#advisorSessions.get(key)
+    if (known) return known
+    const id = await this.#host.createAdvisorSession({ parentID: sessionID, advisor, model })
+    this.#advisorSessions.set(key, id)
+    this.#advisorSessionIDs.add(id)
+    return id
+  }
+
+  /** Run one advisor update under the per-run deadline. */
+  async #runAdvisor(advisorSessionID: string, text: string): Promise<AdvisorRunResult> {
+    const controller = new AbortController()
+    const onAbort = () => controller.abort()
+    this.#abort.signal.addEventListener("abort", onAbort, { once: true })
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, this.#config.requestTimeoutMs)
+    try {
+      const result = await this.#host.runAdvisor({ advisorSessionID, text, signal: controller.signal })
+      if (timedOut) return { ok: false, error: `timed out after ${Math.round(this.#config.requestTimeoutMs / 1000)}s` }
+      return result
+    } catch (err) {
+      if (timedOut) return { ok: false, error: `timed out after ${Math.round(this.#config.requestTimeoutMs / 1000)}s` }
+      return { ok: false, error: (err as Error).message }
+    } finally {
+      clearTimeout(timer)
+      this.#abort.signal.removeEventListener("abort", onAbort)
+    }
+  }
+
+  /**
+   * The `advise` tool. Called from the advisor's own session while its review
+   * runs; the answer is the tool result the advisor sees, so it is truthful
+   * about what happened to the note, as omp's is.
+   */
+  async advise(advisorSessionID: string, input: { note?: unknown; severity?: unknown }): Promise<string> {
+    const pass = this.#activePasses.get(advisorSessionID)
+    if (!pass) return "Dropped: no review is in progress for this session."
+    const note = typeof input.note === "string" ? input.note.trim() : ""
+    if (!note) return "Dropped: empty note."
+    const severity: Severity | undefined =
+      input.severity === "nit" || input.severity === "concern" || input.severity === "blocker" ? input.severity : undefined
+    pass.raised += 1
+    // Mid-turn, only a blocker interrupts now; the rest wait for the run to end.
+    if (pass.streaming && severity !== "blocker") {
+      pass.deferred.push({ note, severity })
+      return "Queued for the end of the turn. Do not re-raise."
+    }
+    const routed = await this.#routeNotes(pass.advisor, [{ note, severity }], pass.sessionID, pass.streaming, pass.state, pass.guard)
+    pass.routed += routed
+    return routed > 0 ? "Delivered." : "Dropped: already raised, over this update's budget, or not deliverable now."
+  }
+
+  /** Whether a session is one of this engine's advisor sessions (never reviewed or held). */
+  isAdvisorSession(sessionID: string): boolean {
+    return this.#advisorSessionIDs.has(sessionID)
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Catch-up
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Hold the primary until the reviewer has caught up, when it has fallen
+   * `CATCH_UP_THRESHOLD` steps behind. Called from the `"context"` hook, which
+   * OpenCode awaits before every primary model request, so the returned promise
+   * is what pauses the agent. There is deliberately no time cap: the wait ends
+   * when every step is reviewed, the turn is interrupted, the advisor is turned
+   * off, or `CATCH_UP_RETRIES` retries of a failing pass have run out — at
+   * which point the primary is stopped.
+   */
+  async catchUp(sessionID: string): Promise<void> {
+    const state = this.#sessions.get(sessionID)
+    if (!state || this.#abort.signal.aborted || this.#advisorSessionIDs.has(sessionID)) return
+    if (state.catchUp) return state.catchUp.promise
+    if (state.stepsEnded - state.reviewedSteps < CATCH_UP_THRESHOLD) return
+    if (!this.#isEnabled(sessionID)) return
+    if (this.#host.isClaimOwner && !this.#host.isClaimOwner()) return
+    if (!(await this.#isReviewable(sessionID))) return
+    // A concurrent hook for the same session may have started the wait meanwhile.
+    if (state.catchUp) return (state.catchUp as CatchUp).promise
+
+    let release!: () => void
+    const promise = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    state.catchUp = { promise, release, failures: 0 }
+    this.#host.log("debug", "advisor catch-up wait started", {
+      sessionID,
+      unreviewedSteps: state.stepsEnded - state.reviewedSteps,
+    })
+    this.#reviewNow(sessionID, state)
+    return promise
+  }
+
+  /** Steps the reviewer has not yet covered. */
+  unreviewedSteps(sessionID: string): number {
+    const state = this.#sessions.get(sessionID)
+    return state ? state.stepsEnded - state.reviewedSteps : 0
+  }
+
+  /** A pass that will not run counts its steps as handled, so nothing waits on it. */
+  #skipReview(state: SessionState, reason: string): void {
+    state.backlog = 0
+    state.reviewedSteps = state.stepsEnded
+    this.#releaseCatchUp(state, reason)
+  }
+
+  /** Review now instead of after the debounce or the mid-turn interval. */
+  #reviewNow(sessionID: string, state: SessionState): void {
+    if (state.timer) {
+      clearTimeout(state.timer)
+      state.timer = undefined
+    }
+    if (state.reviewInProgress) {
+      state.queuedReview = { streaming: true }
+      return
+    }
+    void this.review(sessionID, true)
+  }
+
+  /** Decide, after a pass, whether a catch-up wait ends, retries, or stops the primary. */
+  #afterPass(sessionID: string, state: SessionState, queued: boolean): void {
+    const wait = state.catchUp
+    if (!wait) return
+    if (this.#abort.signal.aborted) {
+      this.#releaseCatchUp(state, "plugin shutting down")
+      return
+    }
+    if (state.passFailed) {
+      wait.failures += 1
+      if (wait.failures > CATCH_UP_RETRIES) {
+        void this.#stopForFailedReviews(sessionID, state, wait.failures)
+        return
+      }
+      this.#host.log("debug", "advisor catch-up retrying a failed pass", { sessionID, failures: wait.failures })
+      if (!queued) this.#reviewNow(sessionID, state)
+      return
+    }
+    if (state.stepsEnded - state.reviewedSteps <= 0) {
+      this.#releaseCatchUp(state, "caught up")
+      return
+    }
+    if (!queued) this.#reviewNow(sessionID, state)
+  }
+
+  #releaseCatchUp(state: SessionState, reason: string): void {
+    const wait = state.catchUp
+    if (!wait) return
+    state.catchUp = undefined
+    this.#host.log("debug", "advisor catch-up wait ended", { sessionID: state.sessionID, reason })
+    wait.release()
+  }
+
+  /**
+   * The reviewer kept failing while the primary waited for it. Waiting longer
+   * only spends the user's time, and continuing unreviewed is what the wait
+   * exists to prevent, so the turn is stopped and the user decides.
+   */
+  async #stopForFailedReviews(sessionID: string, state: SessionState, failures: number): Promise<void> {
+    const error = state.lastError ? ` Last error: ${state.lastError}.` : ""
+    try {
+      await this.#host.inject({
+        sessionID,
+        text:
+          `Advisor: the reviewer failed ${failures} times in a row while the agent waited for it to catch up, ` +
+          `so this run was stopped.${error} Fix the reviewer, or run /advisor off to continue without it.`,
+        description: "advisor notice",
+        metadata: { advisor: { kind: "notice", instance: this.#host.instance, raisedAt: Date.now() } },
+        delivery: "queue",
+        resume: false,
+      })
+    } catch (err) {
+      this.#host.log("warn", "advisor stop notice failed", { error: (err as Error).message })
+    }
+    if (this.#host.interrupt) {
+      try {
+        await this.#host.interrupt(sessionID)
+      } catch (err) {
+        this.#host.log("warn", "advisor could not stop the session", { sessionID, error: (err as Error).message })
+      }
+    }
+    this.#releaseCatchUp(state, "reviewer kept failing")
   }
 
   /* ---------------------------------------------------------------- *
@@ -734,8 +902,14 @@ export class AdvisorEngine {
       const delivery: "steer" | "queue" = channel === "steer" ? "steer" : "queue"
       // Only a steering note may wake an idle agent. A queued note rides the
       // running turn (streaming) or waits; a preserve note is a visible card.
+      // After the primary has answered, omp prefaces the batch with its
+      // boundary guidance: first time, then at most once every 50 turns.
+      const boundary =
+        !streaming &&
+        (state.boundaryGuidanceTurn === undefined || state.completedTurns - state.boundaryGuidanceTurn >= BOUNDARY_GUIDANCE_TURNS)
+      if (boundary) state.boundaryGuidanceTurn = state.completedTurns
       const send = (to: "steer" | "queue") => {
-        const text = formatAdvisoryBatch(group, advisor.name)
+        const text = formatAdvisoryBatch(group, advisor.name, { boundary })
         return this.#host.inject({
           sessionID,
           text,
@@ -746,6 +920,7 @@ export class AdvisorEngine {
         })
       }
       let id: string | undefined
+      let sentAs: "steer" | "queue" = delivery
       try {
         id = await send(delivery)
       } catch (err) {
@@ -760,12 +935,19 @@ export class AdvisorEngine {
         this.#host.log("warn", "advisor steer failed; retrying queued", { advisor: advisor.name, error: (err as Error).message })
         try {
           id = await send("queue")
+          sentAs = "queue"
         } catch (retryError) {
           this.#host.log("warn", "advisor note was not delivered, even queued", { advisor: advisor.name, error: (retryError as Error).message })
           return
         }
       }
       if (id) {
+        // A steered note lands in the running turn; a queued or preserved one
+        // can wait minutes in the inbox. Track those, except blockers, so a
+        // note that reaches the model late is filtered out of the request.
+        if (sentAs === "queue" && !group.some((n) => n.severity === "blocker")) {
+          this.staleNotes.track(id, formatAdvisoryBatch(group, advisor.name, { boundary }))
+        }
         state.notesDelivered += group.length
         // Bridge to the OpenChamber panel: one JSONL line per delivered note,
         // keyed by the project directory like the claims. Fail-open inside.
@@ -817,104 +999,6 @@ export class AdvisorEngine {
   }
 
   /**
-   * Pull-mode advice: the agent asks via the `advisor` tool, and the answer is
-   * returned as the tool's own result — which renders in OpenChamber's
-   * timeline, unlike anything we push. One shot, no inspection loop: the
-   * transcript is the evidence. The advice is also tombstoned, so the pushed
-   * review pass treats it as already-raised instead of re-litigating it.
-   */
-  async pullAdvice(sessionID: string, question: string): Promise<string> {
-    if (!this.#isEnabled(sessionID)) {
-      return "Advisor is off for this session: run /advisor on to enable it."
-    }
-    if (this.#pullsInFlight.has(sessionID)) {
-      return "Advisor is already answering a question for this session; wait for that answer before asking again."
-    }
-    this.#pullsInFlight.add(sessionID)
-    try {
-      const messages = await this.#host.listMessages(sessionID)
-      const transcript = renderDelta(messages, {
-        includeThinking: this.#config.includeThinking,
-        maxChars: this.#config.maxTranscriptChars,
-        wip: false,
-      })
-      if (!transcript) return "Advisor declined: there is no conversation to advise on yet."
-      const advisor = this.#config.advisors.find((a) => a.enabled)
-      const model = await this.#host.resolveModel(advisor?.model ?? this.#config.model)
-      const prompt = buildAdvicePrompt({ advisorName: advisor?.name ?? "Advisor", transcript, question })
-      if (this.#abort.signal.aborted) return "Advisor unavailable: the plugin is shutting down."
-      let text: string
-      try {
-        text = (await this.#callModel(advisor, model, prompt)).trim()
-      } catch (err) {
-        if (this.#abort.signal.aborted) return "Advisor unavailable: the plugin is shutting down."
-        // A pull that throws becomes a tool error the agent cannot interpret,
-        // and an agent with a failed tool will sometimes invent the answer.
-        const message = (err as Error).message
-        await this.#noticeOnce(
-          this.#state(sessionID),
-          sessionID,
-          `pull:${message}`,
-          `Advisor: the reviewer's model call failed (${message}), so no advice was returned. /advisor status has the details.`,
-        )
-        return `Advisor unavailable: the reviewer's model call failed (${message}). Do not invent advice; continue on your own judgement.`
-      }
-      const answer = text || "Advisor returned no advice."
-      if (advisor) {
-        const state = this.#state(sessionID)
-        const prior = state.priorNotes.get(advisor.slug) ?? []
-        prior.push(answer)
-        state.priorNotes.set(advisor.slug, prior.slice(-PRIOR_NOTE_LIMIT))
-      }
-      return answer
-    } finally {
-      this.#pullsInFlight.delete(sessionID)
-    }
-  }
-
-  /**
-   * One reviewer model call, bounded by a deadline and retried once on a fast
-   * transient failure. Without the deadline a hung endpoint wedges the whole
-   * review queue for that session — the failure mode that made notes arrive
-   * minutes late. A timeout is not retried: the retry would double the wait for
-   * an endpoint that has already proved it is not answering.
-   */
-  async #callModel(advisor: AdvisorSpec | undefined, model: ModelRef | undefined, prompt: string): Promise<string> {
-    let firstError: unknown
-    for (let attempt = 0; attempt < MAX_MODEL_ATTEMPTS; attempt++) {
-      const controller = new AbortController()
-      const onAbort = () => controller.abort()
-      this.#abort.signal.addEventListener("abort", onAbort, { once: true })
-      let timedOut = false
-      const timer = setTimeout(() => {
-        timedOut = true
-        controller.abort()
-      }, this.#config.requestTimeoutMs)
-      try {
-        return await this.#host.generate({ model, prompt, signal: controller.signal })
-      } catch (err) {
-        if (firstError === undefined) firstError = err
-        if (this.#abort.signal.aborted) throw err
-        if (timedOut) {
-          throw new Error(`timed out after ${Math.round(this.#config.requestTimeoutMs / 1000)}s (no retry: a timeout is not retried)`)
-        }
-        if (attempt < MAX_MODEL_ATTEMPTS - 1 && isTransientFailure(err)) {
-          this.#host.log("debug", "advisor retrying a transient model failure", {
-            advisor: advisor?.name,
-            error: (err as Error).message,
-          })
-          continue
-        }
-        throw new Error(describeFailure(err, attempt + 1, firstError))
-      } finally {
-        clearTimeout(timer)
-        this.#abort.signal.removeEventListener("abort", onAbort)
-      }
-    }
-    throw new Error(describeFailure(firstError, MAX_MODEL_ATTEMPTS, firstError))
-  }
-
-  /**
    * Tell the session once about a failure that otherwise leaves no trace. A
    * reviewer that cannot call its model is indistinguishable from one with
    * nothing to say, so "nothing happened" must never mean "it has been failing
@@ -935,26 +1019,6 @@ export class AdvisorEngine {
     } catch (err) {
       this.#host.log("warn", "advisor notice failed", { error: (err as Error).message })
     }
-  }
-
-  /**
-   * Withdraw earlier notes silently. A retraction is bookkeeping: the agent
-   * must never pay an interruption for the reviewer changing its mind, and the
-   * note must stop being replayed as a tombstone.
-   */
-  #applyRetractions(advisor: AdvisorSpec, retractions: string[], state: SessionState): void {
-    const prior = state.priorNotes.get(advisor.slug) ?? []
-    let removed = 0
-    for (const text of retractions) {
-      for (let i = prior.length - 1; i >= 0; i--) {
-        if (!isSameNote(prior[i]!, text)) continue
-        prior.splice(i, 1)
-        removed += 1
-      }
-    }
-    if (removed === 0) return
-    state.priorNotes.set(advisor.slug, prior)
-    this.#host.log("debug", "advisor retracted earlier notes", { advisor: advisor.name, removed })
   }
 
   /* ---------------------------------------------------------------- *
@@ -980,6 +1044,10 @@ export class AdvisorEngine {
     }[]
     notesDelivered: number
     backlog: number
+    /** Primary steps not yet covered by a successful review pass. */
+    unreviewedSteps: number
+    /** Whether the primary is currently held until the reviewer catches up. */
+    catchingUp: boolean
     reviews: number
     lastReviewAt?: number
     lastNoteCount: number
@@ -1014,6 +1082,8 @@ export class AdvisorEngine {
       }),
       notesDelivered: state.notesDelivered,
       backlog: state.backlog,
+      unreviewedSteps: Math.max(0, state.stepsEnded - state.reviewedSteps),
+      catchingUp: state.catchUp !== undefined,
       reviews: state.reviews,
       lastReviewAt: state.lastReviewAt,
       lastNoteCount: state.lastNoteCount,
@@ -1030,6 +1100,7 @@ export class AdvisorEngine {
     this.#abort.abort()
     for (const state of this.#sessions.values()) {
       if (state.timer) clearTimeout(state.timer)
+      this.#releaseCatchUp(state, "plugin shutting down")
     }
     this.#sessions.clear()
   }

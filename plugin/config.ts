@@ -13,6 +13,7 @@
  * from the working directory up to the repository root (or the home directory
  * when there is no repository).
  */
+import { renderContextFiles } from "./omp-prompts.ts"
 import { execFile } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
@@ -42,11 +43,9 @@ export interface AdvisorOptions {
   includeThinking?: boolean
   /** Discover `WATCHDOG.*` files on disk. Default true. */
   discover?: boolean
-  /** Max tool rounds per review. Default 3: more rounds mostly buy latency. */
-  maxToolRounds?: number
   /** Max characters of transcript sent per review. Default 30000 (latency tracks this). */
   maxTranscriptChars?: number
-  /** Deadline for a single reviewer model call, in milliseconds. */
+  /** Deadline for one advisor review run (all of its steps), in milliseconds. */
   requestTimeoutMs?: number
   /**
    * Add one standing line to the primary agent's system prompt, so an advisory
@@ -95,7 +94,6 @@ export interface AdvisorConfig {
   sharedMaxNotesPerUpdate?: number
   immuneTurns: number
   includeThinking: boolean
-  maxToolRounds: number
   maxTranscriptChars: number
   /** Deadline for a single reviewer model call. */
   requestTimeoutMs: number
@@ -188,7 +186,6 @@ export function resolveOptions(options: AdvisorOptions): Omit<AdvisorConfig, "ad
     contextLine: bool(options.contextLine) ?? envBool("ADVISOR_CONTEXT_LINE") ?? true,
     // Three rounds is enough for a reviewer to check the specific claim it is
     // about to make; more rounds mostly buy latency, one model call each.
-    maxToolRounds: Math.max(0, num(options.maxToolRounds) ?? 3),
     maxTranscriptChars: Math.max(2_000, num(options.maxTranscriptChars) ?? 30_000),
     // Latency tracks prompt size on the reviewer's endpoint: measured on
     // opencode-go/glm-5.3-flash, 16k chars answered in ~4s, 34k in ~13s, 70k in
@@ -431,12 +428,8 @@ export async function discoverAdvisorFiles(
     const content = (await expandAtImports(candidate.content, candidate.path)).trim()
     if (content) contextFiles.push({ path: candidate.path, content })
   }
-  const projectContext =
-    contextFiles.length > 0
-      ? `<project-context>\nContext files: the user's standing project instructions; binding on the driving agent. Enforce them; flag drift immediately; NEVER advise against mandates.\n${contextFiles
-          .map((f) => `<file path="${f.path}">\n${f.content}\n</file>`)
-          .join("\n")}\n</project-context>`
-      : undefined
+  // omp's `context-files.md`, verbatim.
+  const projectContext = renderContextFiles(contextFiles)
 
   const advisors = new Map<string, AdvisorEntry>()
   const sharedParts: string[] = []
@@ -469,26 +462,6 @@ export async function discoverAdvisorFiles(
     sharedMaxNotesPerUpdate,
     projectContext,
     warnings,
-  }
-}
-
-/** Re-read the on-disk project context (AGENTS.md, WATCHDOG.md).
- *
- * The reviewer holds the driving agent to the project's standing instructions,
- * so it must see the current file rather than the copy captured when the plugin
- * loaded: a stale copy asserts retired rules as if they still applied.
- */
-export async function refreshProjectContext(
-  cwd: string,
-  configDir = opencodeConfigDir(),
-): Promise<{ projectContext?: string; watchdogBlocks: string[]; warnings: string[] }> {
-  const discovered = await discoverAdvisorFiles(cwd, configDir)
-  return {
-    projectContext: discovered.projectContext,
-    watchdogBlocks: discovered.watchdogBlocks,
-    // Carried through rather than dropped: a malformed WATCHDOG/AGENTS.md edit
-    // mid-session would otherwise degrade the reviewer's context in silence.
-    warnings: discovered.warnings,
   }
 }
 
@@ -555,7 +528,6 @@ export async function resolveConfig(
     sharedMaxNotesPerUpdate: base.sharedMaxNotesPerUpdate ?? discovered.sharedMaxNotesPerUpdate,
     immuneTurns: base.immuneTurns,
     includeThinking: base.includeThinking,
-    maxToolRounds: base.maxToolRounds,
     maxTranscriptChars: base.maxTranscriptChars,
     requestTimeoutMs: base.requestTimeoutMs,
     contextLine: base.contextLine,

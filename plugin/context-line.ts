@@ -27,7 +27,7 @@ export const STANDING_PREFIX = "[advisor]"
 
 export const STANDING_LINE =
   STANDING_PREFIX +
-  " If a reviewer note arrives after you have written your final answer, deal with it and then finish with a complete restatement of that answer, so the latest one stands on its own."
+  " If a reviewer note arrives after your final answer and changes it, finish with a complete restatement of the corrected answer; if it changes nothing, acknowledge it in at most one line or not at all."
 
 export interface SystemPart {
   type?: string

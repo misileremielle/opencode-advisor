@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { AdvisorConfig } from "../plugin/config.ts"
-import { AdvisorEngine, type EngineHost, type InjectInput, type ModelRef, type NotifyInput, type PersistedCounters } from "../plugin/engine.ts"
+import { AdvisorEngine, type AdvisorRunResult, type EngineHost, type InjectInput, type ModelRef, type NotifyInput, type PersistedCounters } from "../plugin/engine.ts"
 import type { SessionMessage } from "../plugin/transcript.ts"
 import { mkdtempSync } from "node:fs"
 import * as engineOs from "node:os"
@@ -16,7 +16,6 @@ function makeConfig(over: Partial<AdvisorConfig> = {}): AdvisorConfig {
     advisors: [{ name: "Advisor", slug: "advisor", enabled: true, tools: [] }],
     immuneTurns: 3,
     includeThinking: true,
-    maxToolRounds: 6,
     maxTranscriptChars: 60_000,
     requestTimeoutMs: 45_000,
     contextLine: true,
@@ -34,10 +33,16 @@ interface FakeHost extends EngineHost {
   listCalls: number
   persisted: PersistedCounters[]
   logs: string[]
-  contextCalls: number
-  context?: { projectContext?: string; watchdogBlocks: string[]; warnings?: string[] }
   model?: ModelRef
+  /** Every advisor run fails with this error. */
   generateError?: string
+  /** Overrides the scripted advisor run. */
+  run?: (input: { advisorSessionID: string; text: string; signal: AbortSignal }) => Promise<AdvisorRunResult>
+  /** Advisor sessions opened, as `parentID/slug`. */
+  advisorSessions: string[]
+  /** What `advise` answered the fake advisor. */
+  acks: string[]
+  engine?: AdvisorEngine
   /** The first N inject calls throw, to test delivery fallbacks. */
   injectFailures?: number
   session?: { agent?: string; location?: { directory?: string } }
@@ -54,11 +59,8 @@ function makeHost(directory: string, messages: SessionMessage[]): FakeHost {
     persisted: [],
     notesBase,
     logs: [],
-    contextCalls: 0,
-    async refreshContext() {
-      host.contextCalls += 1
-      return host.context
-    },
+    advisorSessions: [],
+    acks: [],
     persistCounters(_sessionID, counters) {
       host.persisted.push(counters)
     },
@@ -66,10 +68,19 @@ function makeHost(directory: string, messages: SessionMessage[]): FakeHost {
       host.listCalls += 1
       return messages
     },
-    async generate({ prompt }) {
-      host.prompts.push(prompt)
-      if (host.generateError) throw new Error(host.generateError)
-      return host.responses.shift() ?? '{"notes":[]}'
+    async createAdvisorSession({ parentID, advisor }) {
+      host.advisorSessions.push(`${parentID}/${advisor.slug}`)
+      return `adv_${parentID}_${advisor.slug}`
+    },
+    async runAdvisor(input) {
+      // A scripted advisor: each response is the notes it raises through
+      // the real `advise` path, one call per note.
+      host.prompts.push(input.text)
+      if (host.run) return host.run(input)
+      if (host.generateError) return { ok: false, error: host.generateError }
+      const reply = JSON.parse(host.responses.shift() ?? '{"notes":[]}') as { notes?: { note: string; severity?: string }[] }
+      for (const note of reply.notes ?? []) host.acks.push(await host.engine!.advise(input.advisorSessionID, note))
+      return { ok: true }
     },
     async inject(input) {
       if (host.injectFailures && host.injectFailures > 0) {
@@ -95,6 +106,14 @@ function makeHost(directory: string, messages: SessionMessage[]): FakeHost {
   return host
 }
 
+/** An engine the fake advisor can call back into, as the real `advise` tool does. */
+class TestEngine extends AdvisorEngine {
+  constructor(config: AdvisorConfig, host: FakeHost) {
+    super(config, host)
+    host.engine = this
+  }
+}
+
 const user: SessionMessage = { id: "m1", type: "user", text: "do the thing" }
 const terminal: SessionMessage = { id: "m2", type: "assistant", finish: "stop", content: [{ type: "text", text: "done" }] }
 const midwork: SessionMessage = {
@@ -108,7 +127,7 @@ describe("AdvisorEngine", () => {
   test("preserves a concern as a visible note after a terminal answer", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"Off-by-one in foo.ts"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", false)
 
@@ -121,10 +140,28 @@ describe("AdvisorEngine", () => {
     engine.dispose()
   })
 
+  test("a queued concern is hidden from the model when it arrives late; a blocker never is", async () => {
+    const host = makeHost("/repo", [user, terminal])
+    host.responses.push('{"notes":[{"severity":"concern","note":"Late concern"}]}')
+    const engine = new TestEngine(makeConfig(), host)
+    await engine.review("s1", false)
+    const late = [{ id: "msg_1", role: "user", content: [{ type: "text", text: host.injections[0]!.text }] }]
+    expect(engine.staleNotes.filter(late, Date.now() + 10 * 60_000)).toBe(1)
+    engine.dispose()
+
+    const host2 = makeHost("/repo", [user, terminal])
+    host2.responses.push('{"notes":[{"severity":"blocker","note":"Late blocker"}]}')
+    const engine2 = new TestEngine(makeConfig(), host2)
+    await engine2.review("s1", false)
+    const kept = [{ id: "msg_1", role: "user", content: [{ type: "text", text: host2.injections[0]!.text }] }]
+    expect(engine2.staleNotes.filter(kept, Date.now() + 10 * 60_000)).toBe(0)
+    engine2.dispose()
+  })
+
   test("steers a concern while work is still streaming", async () => {
     const host = makeHost("/repo", [user, midwork])
     host.responses.push('{"notes":[{"severity":"concern","note":"Wrong path"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", true)
 
@@ -135,7 +172,7 @@ describe("AdvisorEngine", () => {
 
   test("does nothing while disabled", async () => {
     const host = makeHost("/repo", [user, terminal])
-    const engine = new AdvisorEngine(makeConfig({ enabled: false }), host)
+    const engine = new TestEngine(makeConfig({ enabled: false }), host)
 
     await engine.review("s1", false)
 
@@ -148,7 +185,7 @@ describe("AdvisorEngine", () => {
     const messages: SessionMessage[] = [user, terminal]
     const host = makeHost("/repo", messages)
     host.responses.push('{"notes":[{"note":"LGTM"},{"severity":"concern","note":"Real issue"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
     expect(host.injections).toHaveLength(1)
     expect(host.injections[0]!.text).toContain("Real issue")
@@ -161,20 +198,6 @@ describe("AdvisorEngine", () => {
     engine.dispose()
   })
 
-  test("runs the read tool loop before advising", async () => {
-    const host = makeHost("/repo", [user, midwork])
-    host.responses.push('{"tool":"read","input":{"path":"src/foo.ts"}}')
-    host.responses.push('{"notes":[{"severity":"concern","note":"Simpler approach available"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
-
-    await engine.review("s1", false)
-
-    expect(host.prompts).toHaveLength(2)
-    expect(host.prompts[1]).toContain("<inspection")
-    expect(host.injections).toHaveLength(1)
-    engine.dispose()
-  })
-
   test("respects the per-advisor note budget", async () => {
     const host = makeHost("/repo", [user, midwork])
     host.responses.push(
@@ -183,7 +206,7 @@ describe("AdvisorEngine", () => {
     const config = makeConfig({
       advisors: [{ name: "Advisor", slug: "advisor", enabled: true, tools: [], maxNotesPerUpdate: 2 }],
     })
-    const engine = new AdvisorEngine(config, host)
+    const engine = new TestEngine(config, host)
 
     await engine.review("s1", false)
 
@@ -202,7 +225,7 @@ describe("AdvisorEngine", () => {
     ]
     const host = makeHost("/repo", messages)
     host.responses.push('{"notes":[]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", false)
 
@@ -214,7 +237,7 @@ describe("AdvisorEngine", () => {
 
   test("status separates the session switch from the roster switch", () => {
     const host = makeHost("/repo", [user, terminal])
-    const engine = new AdvisorEngine(makeConfig({ enabled: false }), host)
+    const engine = new TestEngine(makeConfig({ enabled: false }), host)
 
     let status = engine.status("s1")
     expect(status.enabled).toBe(false)
@@ -242,7 +265,7 @@ describe("AdvisorEngine", () => {
     host.onSessionOverride = (sessionID, enabled) => {
       calls.push([sessionID, enabled])
     }
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     engine.setSessionEnabled("s1", true)
     engine.setSessionEnabled("s1", undefined, false)
@@ -253,7 +276,7 @@ describe("AdvisorEngine", () => {
   test("records a review pass even when it raises no notes", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", false)
 
@@ -269,7 +292,7 @@ describe("AdvisorEngine", () => {
     const messages: SessionMessage[] = [user, terminal]
     const host = makeHost("/repo", messages)
     host.responses.push('{"notes":[]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", true)
     expect(engine.status("s1").lastOutcome).toBe("no notes (in progress)")
@@ -288,7 +311,7 @@ describe("AdvisorEngine", () => {
       calls.push(input)
     }
     host.responses.push('{"notes":[{"severity":"concern","note":"Guard the empty case"}]}')
-    const engine = new AdvisorEngine(makeConfig({ notify: "away" }), host)
+    const engine = new TestEngine(makeConfig({ notify: "away" }), host)
 
     await engine.review("s1", false)
 
@@ -307,7 +330,7 @@ describe("AdvisorEngine", () => {
       calls += 1
     }
     host.responses.push('{"notes":[{"severity":"blocker","note":"Stop"}]}')
-    const engine = new AdvisorEngine(makeConfig({ notify: "off" }), host)
+    const engine = new TestEngine(makeConfig({ notify: "off" }), host)
 
     await engine.review("s1", false)
 
@@ -322,7 +345,7 @@ describe("AdvisorEngine", () => {
       calls.push(input)
     }
     host.responses.push('{"notes":[{"severity":"concern","note":"Note"}]}')
-    const engine = new AdvisorEngine(makeConfig({ notify: "always" }), host)
+    const engine = new TestEngine(makeConfig({ notify: "always" }), host)
 
     await engine.review("s1", false)
 
@@ -333,7 +356,7 @@ describe("AdvisorEngine", () => {
   test("counts the notes a review pass raises", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"Guard the empty case"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", false)
 
@@ -349,7 +372,7 @@ describe("AdvisorEngine", () => {
       calls.push(input)
     }
     host.responses.push('{"notes":[{"severity":"blocker","note":"This drops the last write"}]}')
-    const engine = new AdvisorEngine(makeConfig({ notify: "away" }), host)
+    const engine = new TestEngine(makeConfig({ notify: "away" }), host)
 
     await engine.review("s1", false)
 
@@ -362,7 +385,7 @@ describe("AdvisorEngine", () => {
   test("suppresses a reworded repeat of an earlier note", async () => {
     const messages: SessionMessage[] = [user, midwork]
     const host = makeHost("/repo", messages)
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     host.responses.push('{"notes":[{"severity":"concern","note":"The emit URL is built from the origin so a path prefix is dropped"}]}')
     await engine.review("s1", true)
@@ -376,48 +399,13 @@ describe("AdvisorEngine", () => {
     engine.dispose()
   })
 
-  test("grounds each pass in the whole current turn, not just the last step", async () => {
-    const messages: SessionMessage[] = [user, midwork]
-    const host = makeHost("/repo", messages)
-    host.responses.push('{"notes":[{"severity":"nit","note":"one"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", true)
-
-    messages.push({ id: "m7", type: "assistant", finish: "tool-calls", content: [{ type: "text", text: "second step" }] })
-    host.responses.push('{"notes":[]}')
-    await engine.review("s1", true)
-
-    // A one-step slice would have started after the tool call; the turn's user
-    // message is what keeps a mid-turn reviewer from reasoning off partial evidence.
-    expect(host.prompts[1]).toContain("do the thing")
-    engine.dispose()
-  })
-
-  test("applies a retraction silently and stops replaying the note", async () => {
-    const messages: SessionMessage[] = [user, terminal]
-    const host = makeHost("/repo", messages)
-    const note = "Reconsider the merge direction before pushing"
-    host.responses.push(`{"notes":[{"severity":"blocker","note":"${note}"}]}`)
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", false)
-    expect(host.injections).toHaveLength(1)
-
-    messages.push({ id: "m8", type: "assistant", finish: "stop", content: [{ type: "text", text: "more" }] })
-    host.responses.push(`{"retractions":["${note}"],"notes":[]}`)
-    await engine.review("s1", false)
-    expect(host.injections).toHaveLength(1)
-
-    messages.push({ id: "m9", type: "assistant", finish: "stop", content: [{ type: "text", text: "more" }] })
-    host.responses.push('{"notes":[]}')
-    await engine.review("s1", false)
-    expect(host.prompts[2]).not.toContain("<already-raised>")
-    engine.dispose()
-  })
-
   test("caps delivered blockers per user turn", async () => {
-    const host = makeHost("/repo", [user, midwork])
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const messages = [user, midwork]
+    const host = makeHost("/repo", messages)
+    const engine = new TestEngine(makeConfig(), host)
     for (let i = 0; i < 3; i++) {
+      // Reviews are incremental, so each pass needs new work to review.
+      if (i > 0) messages.push({ ...midwork, id: `step${i}` })
       host.responses.push(`{"notes":[{"severity":"blocker","note":"blocker number ${i}"}]}`)
       await engine.review("s1", true)
     }
@@ -429,7 +417,7 @@ describe("AdvisorEngine", () => {
     const host = makeHost("/repo", [user, terminal])
     host.model = { providerID: "p", id: "m", warning: 'the configured model "opencode-go/GLM-5.3-Flash" is not in provider "opencode-go"' }
     host.responses.push('{"notes":[]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
 
     const notices = host.injections.filter((i) => (i.metadata as { advisor?: { kind?: string } })?.advisor?.kind === "notice")
@@ -448,7 +436,7 @@ describe("AdvisorEngine", () => {
   test("says so once when the reviewer's model call fails", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.generateError = "Model unavailable: opencode-go/GLM-5.3-Flash"
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
 
     const notices = host.injections.filter((i) => (i.metadata as { advisor?: { kind?: string } })?.advisor?.kind === "notice")
@@ -457,14 +445,14 @@ describe("AdvisorEngine", () => {
 
     await engine.review("s1", false)
     expect(host.injections).toHaveLength(1)
-    expect(engine.status("s1").lastOutcome).toBe("model error")
+    expect(engine.status("s1").lastOutcome).toBe("advisor error")
     engine.dispose()
   })
 
   test("says nothing extra when the model resolves cleanly", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
     expect(host.injections).toHaveLength(0)
     expect(engine.status("s1").modelWarning).toBeUndefined()
@@ -472,14 +460,16 @@ describe("AdvisorEngine", () => {
   })
 
   test("a nit does not survive a settled turn", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const messages = [user, terminal]
+    const host = makeHost("/repo", messages)
+    const engine = new TestEngine(makeConfig(), host)
 
     host.responses.push('{"notes":[{"severity":"nit","note":"Consider renaming the flag"}]}')
     await engine.review("s1", false)
     expect(host.injections).toHaveLength(0)
 
     // The same note while a turn is running still shapes the next step.
+    messages.push({ ...midwork, id: "later" })
     host.responses.push('{"notes":[{"severity":"nit","note":"Consider renaming the flag"}]}')
     await engine.review("s1", true)
     expect(host.injections).toHaveLength(1)
@@ -489,7 +479,7 @@ describe("AdvisorEngine", () => {
   test("a concern still lands after the turn settles", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"The retry loop can spin forever"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
     expect(host.injections).toHaveLength(1)
     expect(host.injections[0]!.delivery).toBe("queue")
@@ -508,7 +498,7 @@ describe("AdvisorEngine", () => {
       host.agents = roster
       host.session = { agent, location: { directory: "/repo" } }
       host.responses.push('{"notes":[{"severity":"concern","note":"should not run"}]}')
-      const engine = new AdvisorEngine(makeConfig(), host)
+      const engine = new TestEngine(makeConfig(), host)
       await engine.review("s1", false)
       expect(host.prompts).toHaveLength(0)
       expect(host.injections).toHaveLength(0)
@@ -521,7 +511,7 @@ describe("AdvisorEngine", () => {
     host.agents = [{ id: "build", mode: "primary", hidden: false }]
     host.session = { agent: "build", location: { directory: "/repo" } }
     host.responses.push('{"notes":[{"severity":"concern","note":"real advice"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
     expect(host.injections).toHaveLength(1)
     engine.dispose()
@@ -532,7 +522,7 @@ describe("AdvisorEngine", () => {
     host.agents = [{ id: "build", mode: "primary", hidden: false }]
     host.session = { agent: "build", location: { directory: "/elsewhere" } }
     host.responses.push('{"notes":[{"severity":"concern","note":"wrong repo"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
     expect(host.injections).toHaveLength(0)
     engine.dispose()
@@ -543,214 +533,21 @@ describe("AdvisorEngine", () => {
     host.agents = []
     host.session = { agent: "build", location: { directory: "/repo" } }
     host.responses.push('{"notes":[{"severity":"concern","note":"still reviewed"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
     expect(host.injections).toHaveLength(1)
-    engine.dispose()
-  })
-
-  test("pull advice returns the tool answer and tombstones it", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    host.responses.push("1. Merge feature into test first\n2. Push after CI")
-    const engine = new AdvisorEngine(makeConfig(), host)
-
-    const answer = await engine.pullAdvice("s1", "what merge order")
-    expect(answer).toContain("Merge feature into test first")
-    expect(host.prompts).toHaveLength(1)
-    expect(host.prompts[0]).toContain("--- CONVERSATION TRANSCRIPT ---")
-    expect(host.prompts[0]).toContain("do the thing")
-    expect(host.prompts[0]).toContain("--- QUESTION ---\n\nwhat merge order")
-
-    // The pushed reviewer must treat requested advice as already-raised, not
-    // re-litigate it — and the tool result is filtered from the delta, so the
-    // tombstone is the only way it knows the advice exists.
-    host.responses.push('{"notes":[]}')
-    await engine.review("s1", false)
-    expect(host.prompts[1]).toContain("<already-raised>")
-    expect(host.prompts[1]).toContain("Merge feature into test first")
-    engine.dispose()
-  })
-
-  test("pull advice is gated by the session switch", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    const engine = new AdvisorEngine(makeConfig(), host)
-    engine.setSessionEnabled("s1", false)
-    const answer = await engine.pullAdvice("s1", "anything")
-    expect(answer).toContain("/advisor on")
-    expect(host.prompts).toHaveLength(0)
-    engine.dispose()
-  })
-
-  test("one pull at a time per session", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    let release!: () => void
-    const gate = new Promise<void>((resolve) => (release = resolve))
-    host.generate = async ({ prompt }) => {
-      host.prompts.push(prompt)
-      await gate
-      return "advice"
-    }
-    const engine = new AdvisorEngine(makeConfig(), host)
-
-    const first = engine.pullAdvice("s1", "first")
-    const second = await engine.pullAdvice("s1", "second")
-    expect(second).toContain("already answering")
-    release()
-    expect(await first).toBe("advice")
-    engine.dispose()
-  })
-
-  test("times out a hung model call instead of wedging the queue", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    host.generate = ({ prompt, signal }) => {
-      host.prompts.push(prompt)
-      return new Promise<string>((_resolve, reject) => {
-        signal.addEventListener("abort", () => reject(new Error("The operation was aborted")))
-      })
-    }
-    const engine = new AdvisorEngine(makeConfig({ requestTimeoutMs: 30 }), host)
-    await engine.review("s1", false)
-
-    const status = engine.status("s1")
-    expect(status.lastOutcome).toBe("model error")
-    expect(status.lastError).toContain("timed out after")
-    // A timeout is not retried: one attempt, then report.
-    expect(host.prompts).toHaveLength(1)
-    engine.dispose()
-  })
-
-  test("retries a fast transient model failure once", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    let attempts = 0
-    host.generate = async ({ prompt }) => {
-      host.prompts.push(prompt)
-      attempts += 1
-      if (attempts === 1) throw new Error("read ECONNRESET")
-      return '{"notes":[{"severity":"concern","note":"recovered advice"}]}'
-    }
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", false)
-
-    expect(host.prompts).toHaveLength(2)
-    expect(host.injections).toHaveLength(1)
-    expect(host.injections[0]!.text).toContain("recovered advice")
-    engine.dispose()
-  })
-
-  test("retries a provider-side upstream failure once", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    let attempts = 0
-    host.generate = async ({ prompt }) => {
-      host.prompts.push(prompt)
-      attempts += 1
-      // Observed verbatim from opencode-go: a transient upstream error, not a
-      // request this plugin can fix.
-      if (attempts === 1) throw new Error("Streaming response failed: [server_error] upstream service timeout")
-      return '{"notes":[{"severity":"concern","note":"survived an upstream blip"}]}'
-    }
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", false)
-
-    expect(host.prompts).toHaveLength(2)
-    expect(host.injections).toHaveLength(1)
-    expect(host.injections[0]!.text).toContain("survived an upstream blip")
-    engine.dispose()
-  })
-
-  test("retries a stream cut before the completion marker", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    let attempts = 0
-    host.generate = async ({ prompt }) => {
-      host.prompts.push(prompt)
-      attempts += 1
-      // Observed verbatim from bifrost: a truncated stream, which is exactly what
-      // a retry is for. It was previously classified as permanent and not retried.
-      if (attempts === 1) throw new Error("provider closed the stream before sending a completion marker (upstream connection ended mid-stream)")
-      return '{"notes":[{"severity":"concern","note":"recovered from a cut stream"}]}'
-    }
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", false)
-
-    expect(host.prompts).toHaveLength(2)
-    expect(host.injections).toHaveLength(1)
-    expect(host.injections[0]!.text).toContain("recovered from a cut stream")
-    engine.dispose()
-  })
-
-  test("does not retry a permanent failure", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    host.generate = async ({ prompt }) => {
-      host.prompts.push(prompt)
-      throw new Error("virtual key is required")
-    }
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", false)
-
-    expect(host.prompts).toHaveLength(1)
-    expect(engine.status("s1").lastOutcome).toBe("model error")
-    engine.dispose()
-  })
-
-  test("pull advice fails gracefully instead of throwing", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    host.generate = async ({ prompt }) => {
-      host.prompts.push(prompt)
-      throw new Error("socket hang up")
-    }
-    const engine = new AdvisorEngine(makeConfig(), host)
-
-    const answer = await engine.pullAdvice("s1", "anything")
-    expect(answer).toContain("Advisor unavailable")
-    expect(answer).toContain("Do not invent advice")
-    expect(host.prompts).toHaveLength(2)
-    const notices = host.injections.filter((i) => (i.metadata as { advisor?: { kind?: string } })?.advisor?.kind === "notice")
-    expect(notices).toHaveLength(1)
-    engine.dispose()
-  })
-
-  test("a retried failure names the attempt count and the first error", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    let attempts = 0
-    host.generate = async ({ prompt }) => {
-      host.prompts.push(prompt)
-      attempts += 1
-      if (attempts === 1) throw new Error("first: read ECONNRESET")
-      throw new Error("last: upstream service timeout")
-    }
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", false)
-
-    const notice = host.injections.find((i) => (i.metadata as { advisor?: { kind?: string } })?.advisor?.kind === "notice")
-    expect(notice).toBeDefined()
-    expect(notice!.text).toContain("2 attempts")
-    expect(notice!.text).toContain("first: read ECONNRESET")
-    expect(notice!.text).toContain("last: upstream service timeout")
-    engine.dispose()
-  })
-
-  test("a failure that was not retried says so", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    host.generate = async ({ prompt }) => {
-      host.prompts.push(prompt)
-      throw new Error("virtual key is required")
-    }
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", false)
-
-    const notice = host.injections.find((i) => (i.metadata as { advisor?: { kind?: string } })?.advisor?.kind === "notice")
-    expect(notice!.text).toContain("not retried: not a transient failure")
     engine.dispose()
   })
 
   test("a plugin shutdown does not page the user", async () => {
     const host = makeHost("/repo", [user, terminal])
-    host.generate = ({ signal }) =>
-      new Promise<string>((_resolve, reject) => {
+    host.run = ({ signal }) =>
+      new Promise<AdvisorRunResult>((_resolve, reject) => {
         signal.addEventListener("abort", () =>
           reject(new Error("Connection lost while reading the response: ECONNRESET")),
         )
       })
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     const pending = engine.review("s1", false)
     await new Promise((resolve) => setTimeout(resolve, 5))
@@ -763,24 +560,9 @@ describe("AdvisorEngine", () => {
     expect(host.persisted).toHaveLength(0)
   })
 
-  test("a pull during shutdown answers quietly", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    host.generate = ({ signal }) =>
-      new Promise<string>((_resolve, reject) => {
-        signal.addEventListener("abort", () => reject(new Error("ECONNRESET")))
-      })
-    const engine = new AdvisorEngine(makeConfig(), host)
-
-    const pending = engine.pullAdvice("s1", "anything")
-    await new Promise((resolve) => setTimeout(resolve, 5))
-    engine.dispose()
-    expect(await pending).toContain("shutting down")
-    expect(host.injections).toHaveLength(0)
-  })
-
   test("counters can be seeded, so a reload does not read as never-reviewed", () => {
     const host = makeHost("/repo", [user, terminal])
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     engine.seedCounters("s1", {
       reviews: 50,
       notesDelivered: 37,
@@ -799,7 +581,7 @@ describe("AdvisorEngine", () => {
   test("a completed pass persists its counters", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
 
     const last = host.persisted.at(-1)
@@ -811,7 +593,7 @@ describe("AdvisorEngine", () => {
   test("a failed pass persists its failure, not just its success", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.generateError = "virtual key is required"
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
 
     expect(host.persisted.at(-1)?.lastError).toContain("virtual key is required")
@@ -821,7 +603,7 @@ describe("AdvisorEngine", () => {
   test("command replies are always queued, so OpenChamber can surface them", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[]}', '{"notes":[]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.reply("s1", "status text")
     expect(host.injections).toHaveLength(1)
@@ -842,7 +624,7 @@ describe("AdvisorEngine", () => {
     host.inject = async () => {
       throw new Error("session closed")
     }
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.reply("s1", "status text")
 
     expect(host.logs.some((l) => l.includes("advisor reply was not delivered"))).toBe(true)
@@ -852,7 +634,7 @@ describe("AdvisorEngine", () => {
   test("notes and notices carry a raisedAt stamp", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"stamped"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
 
     const meta = host.injections[0]!.metadata as { advisor?: { raisedAt?: number } }
@@ -860,55 +642,10 @@ describe("AdvisorEngine", () => {
     engine.dispose()
   })
 
-  test("the project context is re-read per review, so a doc edit lands without a reload", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    host.context = { watchdogBlocks: [], projectContext: "<project-context>130 tests</project-context>" }
-    host.responses.push('{"notes":[]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", false)
-
-    expect(host.contextCalls).toBe(1)
-    expect(host.prompts[0]).toContain("130 tests")
-
-    // A second pass inside the TTL reuses the read instead of hitting the disk again.
-    host.responses.push('{"notes":[]}')
-    await engine.review("s1", false)
-    expect(host.contextCalls).toBe(1)
-    engine.dispose()
-  })
-
-  test("a malformed context file is reported once", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    host.context = { watchdogBlocks: [], warnings: ["WATCHDOG.yml is not valid YAML"] }
-    host.responses.push('{"notes":[]}', '{"notes":[]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", false)
-    await engine.review("s1", false)
-
-    const warnings = host.logs.filter((l) => l.includes("project context has warnings"))
-    expect(warnings).toHaveLength(1)
-    engine.dispose()
-  })
-
-  test("an unparseable reply keeps an excerpt, so the next one is diagnosable", async () => {
-    const host = makeHost("/repo", [user, terminal])
-    host.responses.push("I think the change looks fine to me, no notes needed.")
-    const engine = new AdvisorEngine(makeConfig(), host)
-    await engine.review("s1", false)
-
-    const status = engine.status("s1")
-    expect(status.lastOutcome).toBe("unparseable reply")
-    expect(status.lastError).toContain("unparseable reply:")
-    expect(status.lastError).toContain("I think the change looks fine")
-    // Persisted too, so a reload does not erase the only evidence it happened.
-    expect(host.persisted.at(-1)?.lastError).toContain("unparseable reply:")
-    engine.dispose()
-  })
-
   test("a note never resumes an idle session", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"blocker","note":"Stop and fix the schema"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", false)
 
@@ -921,7 +658,7 @@ describe("AdvisorEngine", () => {
   test("a mid-turn concern steers the running turn", async () => {
     const host = makeHost("/repo", [user, midwork])
     host.responses.push('{"notes":[{"severity":"concern","note":"Check the guard"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", true)
 
@@ -933,7 +670,7 @@ describe("AdvisorEngine", () => {
   test("a steered note on an already-answered turn asks for a restatement", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"The port is wrong"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", true)
 
@@ -945,7 +682,7 @@ describe("AdvisorEngine", () => {
   test("a steered note mid-work carries the conditional hint too", async () => {
     const host = makeHost("/repo", [user, midwork])
     host.responses.push('{"notes":[{"severity":"concern","note":"Check the guard"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", true)
 
@@ -957,7 +694,7 @@ describe("AdvisorEngine", () => {
   test("a delivered note lands in the notes bridge for the panel", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"The port is wrong"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", false)
 
@@ -977,7 +714,7 @@ describe("AdvisorEngine", () => {
   test("a preserved note on a settled turn also asks for a restatement", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"The port is wrong"}]}')
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", false)
 
@@ -990,7 +727,7 @@ describe("AdvisorEngine", () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"The port is wrong"}]}')
     host.injectFailures = 1
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", true)
 
@@ -1006,7 +743,7 @@ describe("AdvisorEngine", () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"The port is wrong"}]}')
     host.injectFailures = 99
-    const engine = new AdvisorEngine(makeConfig(), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     await engine.review("s1", false)
 
@@ -1014,6 +751,251 @@ describe("AdvisorEngine", () => {
     expect(host.logs.some((l) => l.includes("was not delivered"))).toBe(true)
     // Nothing was delivered, so the counters must not claim otherwise.
     expect(host.persisted.at(-1)?.notesDelivered ?? 0).toBe(0)
+    engine.dispose()
+  })
+})
+
+describe("AdvisorEngine catch-up", () => {
+  const stepEnded = (sessionID = "s1") => ({ type: "session.step.ended", data: { sessionID, finish: "tool-calls" } })
+
+  /** Let the wait register: `catchUp` checks reviewability before it holds. */
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  /** Fail the test instead of hanging when a wait never ends. */
+  function within<T>(promise: Promise<T>, ms = 2_000): Promise<T | "timeout"> {
+    return Promise.race([promise, new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), ms))])
+  }
+
+  function makeCatchUpHost() {
+    const host = makeHost("/repo", [user, midwork]) as FakeHost & { interrupts: string[] }
+    host.interrupts = []
+    host.interrupt = async (sessionID) => {
+      host.interrupts.push(sessionID)
+    }
+    return host
+  }
+
+  test("does not wait while fewer than 5 steps are unreviewed", async () => {
+    const host = makeCatchUpHost()
+    const engine = new TestEngine(makeConfig(), host)
+    for (let i = 0; i < 4; i++) engine.onEvent(stepEnded())
+
+    expect(await within(engine.catchUp("s1"), 50)).toBeUndefined()
+    expect(engine.status("s1").catchingUp).toBe(false)
+    engine.dispose()
+  })
+
+  test("waits at 5 unreviewed steps and releases once every step is reviewed", async () => {
+    const host = makeCatchUpHost()
+    let answer!: (result: AdvisorRunResult) => void
+    host.run = () => new Promise<AdvisorRunResult>((resolve) => (answer = resolve))
+    const engine = new TestEngine(makeConfig(), host)
+    for (let i = 0; i < 5; i++) engine.onEvent(stepEnded())
+    expect(engine.unreviewedSteps("s1")).toBe(5)
+
+    const wait = engine.catchUp("s1")
+    await tick()
+    expect(engine.status("s1").catchingUp).toBe(true)
+    answer({ ok: true })
+    expect(await within(wait)).toBeUndefined()
+
+    // The review ran immediately rather than after the debounce.
+    expect(host.prompts.length).toBeGreaterThanOrEqual(1)
+    expect(engine.unreviewedSteps("s1")).toBe(0)
+    expect(engine.status("s1").catchingUp).toBe(false)
+    expect(host.interrupts).toHaveLength(0)
+    engine.dispose()
+  })
+
+  test("retries a failing pass 3 times, then stops the primary with a notice", async () => {
+    const host = makeCatchUpHost()
+    host.generateError = "401 unauthorized"
+    const engine = new TestEngine(makeConfig(), host)
+    for (let i = 0; i < 5; i++) engine.onEvent(stepEnded())
+
+    expect(await within(engine.catchUp("s1"))).toBeUndefined()
+
+    // The first pass plus 3 retries, each a single non-transient attempt.
+    expect(host.prompts).toHaveLength(4)
+    expect(host.interrupts).toEqual(["s1"])
+    const notice = host.injections.find((i) => i.text.includes("failed 4 times in a row"))
+    expect(notice?.delivery).toBe("queue")
+    expect(notice?.text).toContain("401 unauthorized")
+    // Failed passes leave their steps unreviewed.
+    expect(engine.unreviewedSteps("s1")).toBe(5)
+    engine.dispose()
+  })
+
+  test("a retry that succeeds releases the wait without stopping, and re-reads the failed slice", async () => {
+    const host = makeCatchUpHost()
+    let failures = 2
+    host.run = async () => {
+      if (failures > 0) {
+        failures -= 1
+        return { ok: false, error: "401 unauthorized" }
+      }
+      return { ok: true }
+    }
+    const engine = new TestEngine(makeConfig(), host)
+    for (let i = 0; i < 5; i++) engine.onEvent(stepEnded())
+
+    expect(await within(engine.catchUp("s1"))).toBeUndefined()
+
+    expect(host.prompts).toHaveLength(3)
+    // The successful retry still saw the transcript the failed passes could not review.
+    expect(host.prompts[2]).toContain("edit")
+    expect(host.interrupts).toHaveLength(0)
+    expect(engine.unreviewedSteps("s1")).toBe(0)
+    engine.dispose()
+  })
+
+  test("an interrupted turn releases the wait", async () => {
+    const host = makeCatchUpHost()
+    let answer!: (result: AdvisorRunResult) => void
+    host.run = () => new Promise<AdvisorRunResult>((resolve) => (answer = resolve))
+    const engine = new TestEngine(makeConfig(), host)
+    for (let i = 0; i < 5; i++) engine.onEvent(stepEnded())
+
+    const wait = engine.catchUp("s1")
+    await tick()
+    engine.onEvent({ type: "session.execution.interrupted", data: { sessionID: "s1" } })
+
+    expect(await within(wait)).toBeUndefined()
+    expect(engine.status("s1").catchingUp).toBe(false)
+    answer?.({ ok: true })
+    engine.dispose()
+  })
+
+  test("turning the advisor off releases the wait", async () => {
+    const host = makeCatchUpHost()
+    host.run = () => new Promise<AdvisorRunResult>(() => {})
+    const engine = new TestEngine(makeConfig(), host)
+    for (let i = 0; i < 5; i++) engine.onEvent(stepEnded())
+
+    const wait = engine.catchUp("s1")
+    await tick()
+    engine.setSessionEnabled("s1", false, false)
+
+    expect(await within(wait)).toBeUndefined()
+    engine.dispose()
+  })
+
+  test("a disabled advisor never holds the primary", async () => {
+    const host = makeCatchUpHost()
+    const engine = new TestEngine(makeConfig({ enabled: false }), host)
+    for (let i = 0; i < 6; i++) engine.onEvent(stepEnded())
+
+    expect(await within(engine.catchUp("s1"), 50)).toBeUndefined()
+    expect(host.prompts).toHaveLength(0)
+    engine.dispose()
+  })
+})
+
+describe("AdvisorEngine advisor agent", () => {
+  test("advise delivers live on a settled turn, and is truthful once the review ends", async () => {
+    const host = makeHost("/repo", [user, terminal])
+    host.responses.push('{"notes":[{"severity":"concern","note":"The retry loop never backs off"}]}')
+    const engine = new TestEngine(makeConfig(), host)
+
+    await engine.review("s1", false)
+
+    expect(host.acks).toEqual(["Delivered."])
+    expect(host.injections).toHaveLength(1)
+    // Outside a live review the tool says so instead of pretending.
+    expect(await engine.advise("adv_s1_advisor", { note: "late" })).toBe("Dropped: no review is in progress for this session.")
+    engine.dispose()
+  })
+
+  test("mid-turn, a non-blocker waits for the run to end while a blocker interrupts now", async () => {
+    const host = makeHost("/repo", [user, midwork])
+    const engine = new TestEngine(makeConfig(), host)
+    const seenDuringRun: number[] = []
+    host.run = async ({ advisorSessionID }) => {
+      host.acks.push(await engine.advise(advisorSessionID, { note: "Consider a smaller diff", severity: "concern" }))
+      seenDuringRun.push(host.injections.length)
+      host.acks.push(await engine.advise(advisorSessionID, { note: "This deletes the user's data dir", severity: "blocker" }))
+      seenDuringRun.push(host.injections.length)
+      return { ok: true }
+    }
+
+    await engine.review("s1", true)
+
+    expect(host.acks[0]).toBe("Queued for the end of the turn. Do not re-raise.")
+    expect(host.acks[1]).toBe("Delivered.")
+    // Nothing during the concern; the blocker landed while the run was live.
+    expect(seenDuringRun).toEqual([0, 1])
+    expect(host.injections[0]!.text).toContain("deletes the user's data dir")
+    // The deferred concern arrives after the run settles.
+    expect(host.injections).toHaveLength(2)
+    expect(host.injections[1]!.text).toContain("smaller diff")
+    engine.dispose()
+  })
+
+  test("one persistent advisor session per primary session, fed only what is new", async () => {
+    const messages: SessionMessage[] = [user, midwork]
+    const host = makeHost("/repo", messages)
+    const engine = new TestEngine(makeConfig(), host)
+
+    await engine.review("s1", true)
+    messages.push({ id: "m9", type: "assistant", finish: "stop", content: [{ type: "text", text: "all wired up" }] })
+    await engine.review("s1", false)
+
+    expect(host.advisorSessions).toEqual(["s1/advisor"])
+    expect(host.prompts).toHaveLength(2)
+    expect(host.prompts[0]).toContain("### Session update")
+    expect(host.prompts[0]).toContain("[in progress — more steps follow]")
+    expect(host.prompts[1]).toContain("all wired up")
+    expect(host.prompts[1]).not.toContain("do the thing")
+    engine.dispose()
+  })
+
+  test("the advisor's own session is never reviewed or held", async () => {
+    const host = makeHost("/repo", [user, midwork])
+    const engine = new TestEngine(makeConfig(), host)
+    await engine.review("s1", true)
+    expect(engine.isAdvisorSession("adv_s1_advisor")).toBe(true)
+
+    for (let i = 0; i < 6; i++) engine.onEvent({ type: "session.step.ended", data: { sessionID: "adv_s1_advisor", finish: "tool-calls" } })
+
+    expect(engine.unreviewedSteps("adv_s1_advisor")).toBe(0)
+    expect(await engine.catchUp("adv_s1_advisor")).toBeUndefined()
+    engine.dispose()
+  })
+
+  test("a run past its deadline is stopped and counts as a failure", async () => {
+    const host = makeHost("/repo", [user, terminal])
+    let aborted = false
+    host.run = ({ signal }) =>
+      new Promise<AdvisorRunResult>((resolve) => {
+        signal.addEventListener("abort", () => {
+          aborted = true
+          resolve({ ok: false, error: "aborted" })
+        })
+      })
+    const engine = new TestEngine(makeConfig({ requestTimeoutMs: 20 }), host)
+
+    await engine.review("s1", false)
+
+    expect(aborted).toBe(true)
+    expect(engine.status("s1").lastError).toContain("timed out")
+    expect(host.injections.some((i) => i.text.includes("timed out"))).toBe(true)
+    engine.dispose()
+  })
+
+  test("notes after the answer carry omp's boundary guidance the first time only", async () => {
+    const messages: SessionMessage[] = [user, terminal]
+    const host = makeHost("/repo", messages)
+    const engine = new TestEngine(makeConfig(), host)
+    host.responses.push('{"notes":[{"severity":"concern","note":"first late concern"}]}')
+    await engine.review("s1", false)
+    messages.push({ id: "m10", type: "assistant", finish: "stop", content: [{ type: "text", text: "again" }] })
+    host.responses.push('{"notes":[{"severity":"concern","note":"second late concern"}]}')
+    await engine.review("s1", false)
+
+    const notes = host.injections.filter((i) => i.text.includes("late concern"))
+    expect(notes).toHaveLength(2)
+    expect(notes[0]!.text).toContain("aggregated review from other models")
+    expect(notes[1]!.text).not.toContain("aggregated review from other models")
     engine.dispose()
   })
 })
