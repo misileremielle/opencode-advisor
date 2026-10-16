@@ -64,6 +64,12 @@ const MUTATIONS: Mutation[] = [
     replace: "if (false) {",
   },
   {
+    name: "a late note dropped even when it ends the request",
+    file: "plugin/stale.ts",
+    find: 'if (before === undefined || before === "assistant") entry.drop = false',
+    replace: "if (false) entry.drop = false",
+  },
+  {
     name: "model resolution case-sensitive again",
     file: "plugin/model.ts",
     find: "toLowerCase()",
