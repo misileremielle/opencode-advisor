@@ -13,6 +13,9 @@
  * directory automatically and does not dedupe, so combining the two loads it
  * twice.
  */
+import { realpathSync } from "node:fs"
+import { homedir, tmpdir } from "node:os"
+import { join } from "node:path"
 import { Plugin } from "@opencode/plugin"
 import { DEFAULT_TOOLS, resolveConfig, type AdvisorOptions } from "./config.ts"
 import { activeClaimCount, isClaimOwner, releaseClaim, writeClaim } from "./claims.ts"
@@ -37,15 +40,34 @@ export function advisorAgentID(slug: string): string {
 }
 
 /**
- * What an advisor may do: deny everything, then allow only its granted
- * read-only tools and `advise`. Rules are last-match-wins and a wholly denied
- * tool is dropped from the tool list, so this also turns off edit, shell, web,
- * external directories and code mode for it.
+ * Folders outside the session an advisor may read: the skills it checks the
+ * agent against, and OpenCode's temp folder, where screenshots land. Not the
+ * OpenCode config folder itself: its config files hold keys, and `grep`/`glob`
+ * permissions match only the pattern, so a folder grant would expose them.
  */
-export function advisorPermissions(granted: readonly string[]): { action: string; resource: string; effect: "allow" | "deny" }[] {
+export function advisorReadDirs(home = homedir(), tmp = tmpdir()): string[] {
+  const temps = new Set([tmp])
+  try {
+    temps.add(realpathSync(tmp))
+  } catch {}
+  return [join(home, ".config", "opencode", "skills"), ...[...temps].map((dir) => join(dir, "opencode"))]
+}
+
+/**
+ * What an advisor may do: deny everything, then allow only its granted
+ * read-only tools and `advise`, plus reads in `advisorReadDirs`. Rules are
+ * last-match-wins and a wholly denied tool is dropped from the tool list, so
+ * this also turns off edit, shell, web, other external directories and code
+ * mode for it.
+ */
+export function advisorPermissions(
+  granted: readonly string[],
+  readDirs: readonly string[] = advisorReadDirs(),
+): { action: string; resource: string; effect: "allow" | "deny" }[] {
   return [
     { action: "*", resource: "*", effect: "deny" },
     ...[...granted, ADVISE_TOOL].map((action) => ({ action, resource: "*", effect: "allow" as const })),
+    ...readDirs.map((dir) => ({ action: "external_directory", resource: `${dir}/*`, effect: "allow" as const })),
   ]
 }
 
