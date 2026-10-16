@@ -10,6 +10,13 @@
  * being injected and hidden from the model otherwise. The verdict is sticky, so
  * a kept note stays and a dropped one never reappears on a later step. Blockers
  * are never tracked. The message itself stays in the transcript.
+ *
+ * One exception: a note is never dropped when that would leave the request
+ * ending on an assistant message. A queued note is promoted at the idle
+ * boundary as the only input of a new run, right after the final answer, so
+ * dropping it there sends a conversation that ends on that answer, and Claude
+ * models reject it with a 400 ("assistant message prefill"). Such a note is
+ * kept, and the keep is sticky, because the model is about to reply to it.
  */
 
 export const STALE_AFTER_MS = 120_000
@@ -32,6 +39,19 @@ function messageText(message: unknown): string | undefined {
   return parts.length > 0 ? parts.join("") : undefined
 }
 
+function roleOf(message: unknown): unknown {
+  return (message as { role?: unknown } | null)?.role
+}
+
+/** Role of the nearest message before `index` that is not a system update. */
+function previousRole(messages: unknown[], index: number): unknown {
+  for (let i = index - 1; i >= 0; i--) {
+    const role = roleOf(messages[i])
+    if (role !== "system") return role
+  }
+  return undefined
+}
+
 export class StaleNoteFilter {
   #tracked = new Map<string, Tracked>()
   #byText = new Map<string, string>()
@@ -51,22 +71,31 @@ export class StaleNoteFilter {
   filter(messages: unknown, now: number = Date.now()): number {
     if (!Array.isArray(messages) || this.#tracked.size === 0) return 0
     let removed = 0
+    // True while nothing but system updates is kept after index i, so removing
+    // message i would make whatever precedes it the end of the request.
+    let atEnd = true
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i] as { id?: unknown } | null
       const id = typeof message?.id === "string" && this.#tracked.has(message.id) ? message.id : undefined
       const text = id === undefined ? messageText(message) : undefined
       const key = id ?? (text !== undefined ? this.#byText.get(text) : undefined)
-      if (key === undefined) continue
-      const entry = this.#tracked.get(key)
-      if (!entry) continue
-      if (entry.firstSeen === undefined) {
-        entry.firstSeen = now
-        entry.drop = now - entry.injectedAt > STALE_AFTER_MS
+      const entry = key === undefined ? undefined : this.#tracked.get(key)
+      if (entry) {
+        if (entry.firstSeen === undefined) {
+          entry.firstSeen = now
+          entry.drop = now - entry.injectedAt > STALE_AFTER_MS
+        }
+        if (entry.drop && atEnd) {
+          const before = previousRole(messages, i)
+          if (before === undefined || before === "assistant") entry.drop = false
+        }
+        if (entry.drop) {
+          messages.splice(i, 1)
+          removed++
+          continue
+        }
       }
-      if (entry.drop) {
-        messages.splice(i, 1)
-        removed++
-      }
+      if (roleOf(message) !== "system") atEnd = false
     }
     return removed
   }

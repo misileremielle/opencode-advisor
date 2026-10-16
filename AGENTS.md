@@ -163,6 +163,14 @@ bunx tsc --noEmit     # both must be green before any commit
     one that reviews it — the ownership gate left the line absent exactly where it
     mattered, which the household session then demonstrated end to end (no
     restatement after two queued nits).
+18. **Hiding a late note never ends the request on an assistant message.** The
+    late-note filter (`plugin/stale.ts`) keeps a note when nothing but system
+    updates follows it and an assistant message (or nothing) precedes it. A queued
+    note is promoted at the idle boundary as the only input of a new run, so
+    dropping it there sent a conversation ending on the final answer, which Claude
+    models reject with a 400 ("assistant message prefill"); seen three times
+    (2026-10-13, 10-15 twice), each followed by an automatic fallback and "Continue".
+    (`stale.test.ts`, `"never leaves the request ending on an assistant message"`.)
 
 ## Platform constraints (learned the hard way)
 

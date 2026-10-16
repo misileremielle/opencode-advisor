@@ -148,7 +148,10 @@ describe("AdvisorEngine", () => {
     const engine = new TestEngine(makeConfig(), host)
     await engine.review("s1", false)
     expect(host.injections[0]!.delivery).toBe("queue")
-    const late = [{ id: "msg_1", role: "user", content: [{ type: "text", text: host.injections[0]!.text }] }]
+    // Another input follows the note, so hiding it cannot leave the request
+    // ending on an assistant message (stale.test.ts covers that case).
+    const next = { id: "msg_2", role: "user", content: [{ type: "text", text: "next" }] }
+    const late = [{ id: "msg_1", role: "user", content: [{ type: "text", text: host.injections[0]!.text }] }, next]
     expect(engine.staleNotes.filter(late, Date.now() + 10 * 60_000)).toBe(1)
     engine.dispose()
 
@@ -156,7 +159,7 @@ describe("AdvisorEngine", () => {
     host2.responses.push('{"notes":[{"severity":"blocker","note":"Late blocker"}]}')
     const engine2 = new TestEngine(makeConfig(), host2)
     await engine2.review("s1", false)
-    const kept = [{ id: "msg_1", role: "user", content: [{ type: "text", text: host2.injections[0]!.text }] }]
+    const kept = [{ id: "msg_1", role: "user", content: [{ type: "text", text: host2.injections[0]!.text }] }, next]
     expect(engine2.staleNotes.filter(kept, Date.now() + 10 * 60_000)).toBe(0)
     engine2.dispose()
   })
