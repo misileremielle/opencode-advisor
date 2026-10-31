@@ -14,7 +14,6 @@ function makeConfig(over: Partial<AdvisorConfig> = {}): AdvisorConfig {
     enabled: true,
     model: "p/m",
     advisors: [{ name: "Advisor", slug: "advisor", enabled: true, tools: [] }],
-    immuneTurns: 3,
     includeThinking: true,
     maxTranscriptChars: 60_000,
     requestTimeoutMs: 45_000,
@@ -40,6 +39,12 @@ interface FakeHost extends EngineHost {
   run?: (input: { advisorSessionID: string; text: string; signal: AbortSignal }) => Promise<AdvisorRunResult>
   /** Advisor sessions opened, as `parentID/slug`. */
   advisorSessions: string[]
+  /** The model each advisor session was opened with, as `providerID/id`. */
+  advisorModels: (string | undefined)[]
+  /** Every selector `resolveModel` was asked for. */
+  selectors: (string | undefined)[]
+  /** Overrides model resolution per selector. */
+  resolve?: (selector: string | undefined) => ModelRef
   /** What `advise` answered the fake advisor. */
   acks: string[]
   engine?: AdvisorEngine
@@ -60,6 +65,8 @@ function makeHost(directory: string, messages: SessionMessage[]): FakeHost {
     notesBase,
     logs: [],
     advisorSessions: [],
+    advisorModels: [],
+    selectors: [],
     acks: [],
     persistCounters(_sessionID, counters) {
       host.persisted.push(counters)
@@ -68,9 +75,11 @@ function makeHost(directory: string, messages: SessionMessage[]): FakeHost {
       host.listCalls += 1
       return messages
     },
-    async createAdvisorSession({ parentID, advisor }) {
+    async createAdvisorSession({ parentID, advisor, model }) {
       host.advisorSessions.push(`${parentID}/${advisor.slug}`)
-      return `adv_${parentID}_${advisor.slug}`
+      host.advisorModels.push(model ? `${model.providerID}/${model.id}` : undefined)
+      const n = host.advisorSessions.length
+      return `adv_${parentID}_${advisor.slug}${n > 1 ? `_${n}` : ""}`
     },
     async runAdvisor(input) {
       // A scripted advisor: each response is the notes it raises through
@@ -96,7 +105,9 @@ function makeHost(directory: string, messages: SessionMessage[]): FakeHost {
     async listAgents() {
       return host.agents ?? []
     },
-    async resolveModel(): Promise<ModelRef> {
+    async resolveModel(selector): Promise<ModelRef> {
+      host.selectors.push(selector)
+      if (host.resolve) return host.resolve(selector)
       return host.model ?? { providerID: "p", id: "m" }
     },
     log(level, message, data) {
@@ -662,9 +673,9 @@ describe("AdvisorEngine", () => {
     engine.dispose()
   })
 
-  test("wake-ups on settled turns stop at the per-turn steer cap", async () => {
-    // Each woken run adds an assistant answer and no user message, so the cap
-    // is never reset by the advisor's own wake-ups.
+  test("every settled concern wakes the agent, however many came before", async () => {
+    // Each woken run adds an assistant answer and no user message: the
+    // advisor's own wake-ups must not stop the next concern from waking it.
     const transcript: SessionMessage[] = [user, terminal]
     const host = makeHost("/repo", transcript)
     const findings = [
@@ -676,16 +687,35 @@ describe("AdvisorEngine", () => {
       "Test fixture leaks a temp directory per run",
     ]
     for (const note of findings) host.responses.push(JSON.stringify({ notes: [{ severity: "concern", note }] }))
-    const engine = new TestEngine(makeConfig({ immuneTurns: 0 }), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     for (let i = 0; i < 6; i++) {
       await engine.review("s1", false)
       transcript.push({ id: `a${i}`, type: "assistant", finish: "stop", content: [{ type: "text", text: `answer ${i}` }] })
     }
 
-    const wakes = host.injections.filter((inj) => inj.resume)
-    expect(wakes).toHaveLength(4)
-    expect(host.injections.slice(4).every((inj) => inj.delivery === "queue" && inj.resume === false)).toBe(true)
+    expect(host.injections).toHaveLength(6)
+    expect(host.injections.every((inj) => inj.delivery === "steer" && inj.resume === true)).toBe(true)
+    engine.dispose()
+  })
+
+  test("a woken turn that ends still lets the next concern wake it", async () => {
+    // The real sequence: a settled steer wakes the agent, the woken run
+    // succeeds, and the review of that run raises a new concern.
+    const transcript: SessionMessage[] = [user, terminal]
+    const host = makeHost("/repo", transcript)
+    host.responses.push('{"notes":[{"severity":"concern","note":"The retry loop in fetch.ts never backs off"}]}')
+    host.responses.push('{"notes":[{"severity":"concern","note":"config.ts reads PORT before dotenv loads"}]}')
+    const engine = new TestEngine(makeConfig(), host)
+
+    await engine.review("s1", false)
+    transcript.push({ id: "a1", type: "assistant", finish: "stop", content: [{ type: "text", text: "fixed the loop" }] })
+    engine.onEvent({ type: "session.execution.succeeded", data: { sessionID: "s1" } } as never)
+    await engine.review("s1", false)
+
+    expect(host.injections).toHaveLength(2)
+    expect(host.injections[1]!.delivery).toBe("steer")
+    expect(host.injections[1]!.resume).toBe(true)
     engine.dispose()
   })
 
@@ -717,7 +747,7 @@ describe("AdvisorEngine", () => {
     engine.dispose()
   })
 
-  test("past the steer cap, a mid-turn concern still lands at the next step boundary", async () => {
+  test("every mid-turn concern steers the running turn", async () => {
     const transcript: SessionMessage[] = [user, midwork]
     const host = makeHost("/repo", transcript)
     const findings = [
@@ -728,7 +758,7 @@ describe("AdvisorEngine", () => {
       "Logger writes secrets from the auth payload",
     ]
     for (const note of findings) host.responses.push(JSON.stringify({ notes: [{ severity: "concern", note }] }))
-    const engine = new TestEngine(makeConfig({ immuneTurns: 0 }), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     for (let i = 0; i < findings.length; i++) {
       await engine.review("s1", true)
@@ -736,9 +766,7 @@ describe("AdvisorEngine", () => {
     }
 
     expect(host.injections).toHaveLength(5)
-    expect(host.injections.filter((inj) => inj.resume)).toHaveLength(4)
-    expect(host.injections[4]!.delivery).toBe("steer")
-    expect(host.injections[4]!.resume).toBe(false)
+    expect(host.injections.every((inj) => inj.delivery === "steer" && inj.resume === true)).toBe(true)
     engine.dispose()
   })
 
@@ -754,7 +782,7 @@ describe("AdvisorEngine", () => {
     ]
     for (const note of nits) host.responses.push(JSON.stringify({ notes: [{ severity: "nit", note }] }))
     host.responses.push('{"notes":[{"severity":"concern","note":"The port is wrong"}]}')
-    const engine = new TestEngine(makeConfig({ immuneTurns: 0 }), host)
+    const engine = new TestEngine(makeConfig(), host)
 
     for (let i = 0; i < nits.length; i++) {
       await engine.review("s1", true)
@@ -1061,6 +1089,77 @@ describe("AdvisorEngine advisor agent", () => {
 
     expect(engine.unreviewedSteps("adv_s1_advisor")).toBe(0)
     expect(await engine.catchUp("adv_s1_advisor")).toBeUndefined()
+    engine.dispose()
+  })
+
+  test("a session model override opens a new advisor session on that model", async () => {
+    const transcript: SessionMessage[] = [user, midwork]
+    const host = makeHost("/repo", transcript)
+    host.resolve = (selector) =>
+      selector === "Other/Big-Model" ? { providerID: "other", id: "big-model" } : { providerID: "p", id: "m" }
+    const engine = new TestEngine(makeConfig(), host)
+    await engine.review("s1", true)
+
+    const result = await engine.setSessionModel("s1", "Other/Big-Model")
+    expect(result).toEqual({ ok: true, model: "other/big-model" })
+    transcript.push({ ...midwork, id: "w1" })
+    await engine.review("s1", true)
+
+    // The selector keeps the user's spelling; the session is reopened because
+    // an advisor session's model is fixed when it is created.
+    expect(host.selectors.at(-1)).toBe("Other/Big-Model")
+    expect(host.advisorModels).toEqual(["p/m", "other/big-model"])
+    expect(engine.status("s1").modelOverride).toBe("Other/Big-Model")
+    // Other sessions keep the configured model.
+    await engine.review("s2", true)
+    expect(host.selectors.at(-1)).toBe("p/m")
+    engine.dispose()
+  })
+
+  test("a model the registry does not have is refused and changes nothing", async () => {
+    const host = makeHost("/repo", [user, midwork])
+    host.resolve = (selector) =>
+      selector === "nope/missing"
+        ? { providerID: "p", id: "m", warning: 'model "nope/missing" is not in the registry' }
+        : { providerID: "p", id: "m" }
+    const engine = new TestEngine(makeConfig(), host)
+
+    const result = await engine.setSessionModel("s1", "nope/missing")
+    expect(result.ok).toBe(false)
+    expect(engine.status("s1").modelOverride).toBeUndefined()
+    engine.dispose()
+  })
+
+  test("a restored override is kept even while the registry cannot resolve it", async () => {
+    // Config providers can be missing from the registry for a while after a
+    // reload; restoring must not drop the user's choice on that flap.
+    const host = makeHost("/repo", [user, midwork])
+    host.resolve = () => ({ providerID: "p", id: "m", warning: "registry is empty" })
+    const engine = new TestEngine(makeConfig(), host)
+
+    engine.restoreSessionModel("s1", "o/x")
+    expect(engine.status("s1").modelOverride).toBe("o/x")
+    expect(host.selectors).toEqual([])
+    await engine.review("s1", true)
+    expect(host.selectors.at(-1)).toBe("o/x")
+    engine.dispose()
+  })
+
+  test("resetting the override goes back to the configured model", async () => {
+    const transcript: SessionMessage[] = [user, midwork]
+    const host = makeHost("/repo", transcript)
+    host.resolve = (selector) => (selector === "o/x" ? { providerID: "o", id: "x" } : { providerID: "p", id: "m" })
+    const engine = new TestEngine(makeConfig(), host)
+    await engine.setSessionModel("s1", "o/x")
+    await engine.review("s1", true)
+
+    await engine.setSessionModel("s1", undefined)
+    transcript.push({ ...midwork, id: "w1" })
+    await engine.review("s1", true)
+
+    expect(host.selectors.at(-1)).toBe("p/m")
+    expect(host.advisorModels).toEqual(["o/x", "p/m"])
+    expect(engine.status("s1").modelOverride).toBeUndefined()
     engine.dispose()
   })
 

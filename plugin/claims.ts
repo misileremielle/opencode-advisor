@@ -4,7 +4,7 @@
  * Two OpenCode servers can run at once (OpenChamber's managed service and the
  * app's own bundled CLI), and a reload can leave the previous plugin instance
  * alive for a while. Each instance keeps its own session state — its own dedupe
- * history, note budget and immune window — so two live instances review a
+ * history, note budget and blocker cap — so two live instances review a
  * session twice, one of them possibly on older code.
  *
  * In-memory state cannot coordinate that: it is per module evaluation, so a

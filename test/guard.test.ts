@@ -87,10 +87,7 @@ describe("EmissionGuard", () => {
 })
 
 describe("resolveChannel", () => {
-  const base = {
-    streaming: true,
-    interruptImmuneTurnActive: false,
-  }
+  const base = { streaming: true }
 
   test("a settled session is woken only by a concern or blocker", () => {
     expect(resolveChannel({ ...base, streaming: false, severity: "blocker" })).toBe("steer")
@@ -99,24 +96,11 @@ describe("resolveChannel", () => {
     expect(resolveChannel({ ...base, streaming: false, severity: undefined })).toBe("preserve")
   })
 
-  test("the immune window never wakes a settled session", () => {
-    for (const severity of ["blocker", "concern"] as const) {
-      expect(resolveChannel({ streaming: false, interruptImmuneTurnActive: true, severity })).toBe("preserve")
-    }
-  })
-
   test("a running turn takes notes without restarting it", () => {
     expect(resolveChannel({ ...base, severity: "concern" })).toBe("steer")
     expect(resolveChannel({ ...base, severity: "blocker" })).toBe("steer")
     expect(resolveChannel({ ...base, severity: "nit" })).toBe("queue")
     expect(resolveChannel({ ...base, severity: undefined })).toBe("queue")
-  })
-
-  test("the immune window queues everything, blockers included", () => {
-    expect(resolveChannel({ ...base, severity: "concern", interruptImmuneTurnActive: true })).toBe("queue")
-    // One interruption stays one interruption however it is reworded: the
-    // exemption here is what let a malfunctioning reviewer steer five times.
-    expect(resolveChannel({ ...base, severity: "blocker", interruptImmuneTurnActive: true })).toBe("queue")
   })
 })
 

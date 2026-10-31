@@ -4,7 +4,7 @@
  * Two layers, mirroring omp:
  *
  * 1. Plugin options (`ctx.options`) and environment variables — the runtime
- *    knobs (enabled, default model, immuneTurns, ...).
+ *    knobs (enabled, default model, includeThinking, ...).
  * 2. `WATCHDOG.md` / `WATCHDOG.{yml,yaml}` discovered on disk — advisor-only
  *    review guidance and an optional roster of specialist advisors.
  *
@@ -37,8 +37,6 @@ export interface AdvisorOptions {
   tools?: string[]
   /** Max non-blocker notes accepted per review. Default 4. */
   maxNotesPerUpdate?: number
-  /** Turns after an interrupting note during which further notes do not steer. Default 3. */
-  immuneTurns?: number
   /** Include assistant reasoning in the transcript shown to the advisor. Default true. */
   includeThinking?: boolean
   /** Discover `WATCHDOG.*` files on disk. Default true. */
@@ -92,7 +90,6 @@ export interface AdvisorConfig {
   advisors: AdvisorSpec[]
   sharedInstructions?: string
   sharedMaxNotesPerUpdate?: number
-  immuneTurns: number
   includeThinking: boolean
   maxTranscriptChars: number
   /** Deadline for a single reviewer model call. */
@@ -181,7 +178,6 @@ export function resolveOptions(options: AdvisorOptions): Omit<AdvisorConfig, "ad
     model,
     sharedInstructions,
     sharedMaxNotesPerUpdate: maxNotesPerUpdate,
-    immuneTurns: Math.max(0, num(options.immuneTurns ?? process.env.ADVISOR_IMMUNE_TURNS) ?? 3),
     includeThinking: bool(options.includeThinking) ?? envBool("ADVISOR_INCLUDE_THINKING") ?? true,
     contextLine: bool(options.contextLine) ?? envBool("ADVISOR_CONTEXT_LINE") ?? true,
     // Three rounds is enough for a reviewer to check the specific claim it is
@@ -526,7 +522,6 @@ export async function resolveConfig(
     advisors,
     sharedInstructions: base.sharedInstructions ?? discovered.sharedInstructions,
     sharedMaxNotesPerUpdate: base.sharedMaxNotesPerUpdate ?? discovered.sharedMaxNotesPerUpdate,
-    immuneTurns: base.immuneTurns,
     includeThinking: base.includeThinking,
     maxTranscriptChars: base.maxTranscriptChars,
     requestTimeoutMs: base.requestTimeoutMs,

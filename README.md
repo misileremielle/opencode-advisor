@@ -29,8 +29,7 @@ user's request, not to obey it blindly.
     turn there is no next step, so a nit about a settled turn is dropped rather
     than parked in the inbox to arrive stale.
   - `concern` — steers the turn that is already running.
-  - `blocker` — steers the running turn; it is exempt from the note *budget*,
-    not from the immune window.
+  - `blocker` — steers the running turn; it is exempt from the note *budget*.
 
   A `concern` or `blocker` raised after the turn has settled wakes the agent
   (`steer`, `resume: true`), so a finding about a finished answer is acted on
@@ -55,7 +54,10 @@ user's request, not to obey it blindly.
 - **Registers `/advisor`** — `/advisor` toggles for the session, `/advisor on`
   / `off` set it explicitly, `/advisor default` clears the session override,
   `/advisor status` reports each advisor, its model, and notes delivered, and
-  `/advisor dump` lists the advice raised so far. Every card is stamped with the
+  `/advisor dump` lists the advice raised so far. `/advisor model <provider/model>`
+  switches this session's reviewer model (checked against the model list first,
+  kept across reloads), and `/advisor model default` goes back to the configured
+  one. Every card is stamped with the
   moment it was generated (date included once it is not today), and is delivered
   immediately while a turn is running rather than queued behind it. Session toggles
   and review counters are persisted,
@@ -125,7 +127,6 @@ Pass these in the `options` object of the `plugins` entry (or via the
 | `instructions`       | —          | Shared guidance prepended to every advisor's system prompt.             |
 | `tools`              | `read,grep,glob` | Default investigative tools; `[]` grants none.                    |
 | `maxNotesPerUpdate`  | `4`        | Max non-blocker notes accepted per review (`blocker` exempt).           |
-| `immuneTurns`        | `3`        | After a steering note, how many turns every severity stops steering.    |
 | `includeThinking`    | `true`     | Include assistant reasoning in the transcript sent to the reviewer.     |
 | `discover`           | `true`     | Discover `WATCHDOG.*` files on disk.                                    |
 | `maxToolRounds`      | `3`        | Max tool rounds per review (one model call each).                       |
@@ -349,12 +350,9 @@ unreadable agent roster means everything is reviewed, rather than nothing.
 - Silence is the default outcome: the prompt tells the reviewer to advise only on
   concrete technical risk, and the guard drops noise and repeats in code.
 - Only a `concern` or `blocker` can start a turn. On an idle or settled session
-  those two wake the agent; a `nit` is dropped instead. Inside the immune window
-  nothing wakes the agent.
-- After a steering note, `immuneTurns` downgrades further notes to queued
-  ones for the next few turns — blockers included. One interruption stays one
-  interruption however it is reworded.
-- A per-user-turn steering cap (4) is a final safety net against loops.
+  those two wake the agent, every time; a `nit` is dropped instead. Nothing caps
+  the wake-ups: the guard's duplicate and reworded-repeat suppression keeps one
+  finding from waking the agent twice.
 - Reviewers are read-only. Mutating tool grants from omp (`edit`, `write`,
   `bash`, `eval`) are intentionally not supported.
 

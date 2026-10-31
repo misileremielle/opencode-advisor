@@ -148,7 +148,9 @@ export default Plugin.define({
     // (OpenChamber reloads plugins on config/plugin changes).
     const storageKey = "sessionEnabled"
     const countersKey = "sessionCounters"
+    const modelsKey = "sessionModels"
     const overrides: Record<string, boolean> = {}
+    const modelOverrides: Record<string, string> = {}
     const counters: Record<string, PersistedCounters> = {}
     const persistOverrides = async () => {
       const keys = Object.keys(overrides)
@@ -282,6 +284,17 @@ export default Plugin.define({
         if (enabled === undefined) delete overrides[sessionID]
         else overrides[sessionID] = enabled
         await persistOverrides()
+      },
+      async onSessionModel(sessionID, selector) {
+        if (selector === undefined) delete modelOverrides[sessionID]
+        else modelOverrides[sessionID] = selector
+        const keys = Object.keys(modelOverrides)
+        for (const stale of keys.slice(0, Math.max(0, keys.length - 200))) delete modelOverrides[stale]
+        try {
+          await ctx.storage.set(modelsKey, modelOverrides)
+        } catch (err) {
+          console.warn(`[advisor] failed to persist session model: ${(err as Error).message}`)
+        }
       },
       notify(input) {
         void postNotification(input).catch((err) => console.warn(`[advisor] notification failed: ${(err as Error).message}`))
@@ -446,6 +459,20 @@ export default Plugin.define({
       console.warn(`[advisor] failed to read session overrides: ${(err as Error).message}`)
     }
 
+    try {
+      const stored = await ctx.storage.get(modelsKey)
+      if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+        for (const [id, value] of Object.entries(stored as Record<string, unknown>)) {
+          if (typeof value === "string" && value) {
+            modelOverrides[id] = value
+            engine.restoreSessionModel(id, value)
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[advisor] failed to read session models: ${(err as Error).message}`)
+    }
+
     if (!config.enabled) {
       console.info("[advisor] loaded but disabled; enable with /advisor on or the `enabled` option.")
     }
@@ -461,16 +488,36 @@ export default Plugin.define({
       }
     })()
 
-    // `/advisor [on|off|status|dump]` — session-scoped control and inspection.
+    // `/advisor [on|off|status|dump|model <selector>|model default]` — session-scoped control and inspection.
     await ctx.command.transform((editor) => {
       editor.add({
         name: "advisor",
-        description: "Toggle or inspect the advisor reviewer for this session",
+        description: "Toggle, inspect, or change the model of the advisor reviewer for this session",
         execute: async ({ sessionID, prompt }) => {
-          const args = (prompt?.text ?? "").trim().toLowerCase()
+          const raw = (prompt?.text ?? "").trim()
+          const args = raw.toLowerCase()
           const isDump = args === "dump"
+          // Only the subcommand is case-insensitive: the selector keeps the
+          // user's spelling, which is what status echoes back.
+          const modelArg = /^model(?:\s+(.*))?$/i.exec(raw)
           let body: string
-          if (args === "on") {
+          if (modelArg) {
+            const selector = modelArg[1]?.trim()
+            if (!selector) {
+              const current = engine.status(sessionID).modelOverride
+              body = current
+                ? `Advisor: this session reviews with ${current}. /advisor model default to go back to the configured model.`
+                : "Advisor: this session uses the configured model. Usage: /advisor model <provider/model> | default"
+            } else if (selector.toLowerCase() === "default") {
+              await engine.setSessionModel(sessionID, undefined)
+              body = "Advisor: back to the configured model for this session."
+            } else {
+              const result = await engine.setSessionModel(sessionID, selector)
+              body = result.ok
+                ? `Advisor: this session now reviews with ${result.model ?? selector}, from the next review on.`
+                : `Advisor: model unchanged — ${result.error}.`
+            }
+          } else if (args === "on") {
             engine.setSessionEnabled(sessionID, true)
             body = "Advisor: on for this session. /advisor status for details."
           } else if (args === "off") {
@@ -496,7 +543,8 @@ export default Plugin.define({
             if (status.enabled) {
               for (const a of status.advisors) {
                 const state = a.active ? "active" : a.rosterEnabled ? "paused" : "disabled in config"
-                lines.push(`${a.name}: ${state} · model ${a.model ?? "(default)"} · ${a.notes} notes`)
+                const model = status.modelOverride ? `${status.modelOverride} (this session)` : (a.model ?? "(default)")
+                lines.push(`${a.name}: ${state} · model ${model} · ${a.notes} notes`)
               }
             } else {
               lines.push(`Reviewers configured: ${status.advisors.length}`)

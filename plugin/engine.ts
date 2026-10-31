@@ -67,6 +67,8 @@ export interface EngineHost {
   listAgents?(): Promise<{ id: string; mode?: string; hidden?: boolean }[]>
   /** Persist a per-session enable override so it survives a plugin reload. */
   onSessionOverride?(sessionID: string, enabled: boolean | undefined): Promise<void> | void
+  /** Persist a session's `/advisor model` override; undefined clears it. */
+  onSessionModel?(sessionID: string, selector: string | undefined): Promise<void> | void
   /** Persist review counters so /advisor status survives a plugin reload. */
   persistCounters?(sessionID: string, counters: PersistedCounters): void
   /** Raise a user-facing notification (OpenChamber only; a no-op elsewhere). */
@@ -126,13 +128,14 @@ interface SessionState {
   reviewedCount: number
   streaming: boolean
   completedTurns: number
-  immuneTurnStart?: number
   guards: Map<string, EmissionGuard>
   priorNotes: Map<string, string[]>
   reviewInProgress: boolean
   queuedReview: { streaming: boolean } | null
   timer?: ReturnType<typeof setTimeout>
   enabled?: boolean
+  /** `/advisor model <selector>` for this session, in the user's spelling. */
+  modelOverride?: string
   notesDelivered: number
   lastReviewAt?: number
   lastError?: string
@@ -144,7 +147,6 @@ interface SessionState {
   lastOutcome?: string
   backlog: number
   userMessageCount: number
-  steersSinceUser: number
   /** Blockers delivered inside the current user turn (see the per-turn cap). */
   blockersThisUserTurn: number
   /** Why the configured reviewer model could not be used, if it could not. */
@@ -180,9 +182,6 @@ const MAX_BLOCKERS_PER_USER_TURN = 2
 /** How long a session's reviewability verdict is trusted. */
 const SESSION_FILTER_TTL_MS = 5 * 60_000
 const PRIOR_NOTE_LIMIT = 40
-/** Safety net: at most this many steering wake-ups per user turn, so a
- *  confused reviewer cannot loop the primary indefinitely. */
-const MAX_STEERS_PER_USER_TURN = 4
 /**
  * Reviews run in the background until this many primary steps are unreviewed.
  * From then on the primary's next model request waits — with no time cap —
@@ -246,7 +245,6 @@ export class AdvisorEngine {
         lastNoteCount: 0,
         backlog: 0,
         userMessageCount: 0,
-        steersSinceUser: 0,
         blockersThisUserTurn: 0,
         noticesSent: new Set<string>(),
         stepsEnded: 0,
@@ -339,6 +337,42 @@ export class AdvisorEngine {
 
   toggleSession(sessionID: string): boolean {
     return this.setSessionEnabled(sessionID, !this.#isEnabled(sessionID))
+  }
+
+  /**
+   * Point this session's reviewers at another model, or back at the configured
+   * one with `undefined`. The selector is checked against the registry first:
+   * a miss would silently fall back to the default model, so it is refused.
+   * An advisor session's model is fixed when it is created, so the cached
+   * advisor sessions are dropped and the next pass opens new ones.
+   */
+  async setSessionModel(
+    sessionID: string,
+    selector: string | undefined,
+  ): Promise<{ ok: true; model?: string } | { ok: false; error: string }> {
+    let model: string | undefined
+    if (selector !== undefined) {
+      const resolved = await this.#host.resolveModel(selector)
+      if (!resolved) return { ok: false, error: `could not resolve "${selector}"` }
+      if (resolved.warning) return { ok: false, error: resolved.warning }
+      model = `${resolved.providerID}/${resolved.id}`
+    }
+    const state = this.#state(sessionID)
+    state.modelOverride = selector
+    for (const key of [...this.#advisorSessions.keys()]) {
+      if (key.startsWith(`${sessionID}\u0000`)) this.#advisorSessions.delete(key)
+    }
+    void this.#host.onSessionModel?.(sessionID, selector)
+    return { ok: true, model }
+  }
+
+  /**
+   * Restore a persisted override without checking the registry: config
+   * providers can be missing from it for a while after a reload, and a review
+   * that still cannot resolve the selector falls back with a model warning.
+   */
+  restoreSessionModel(sessionID: string, selector: string): void {
+    this.#state(sessionID).modelOverride = selector
   }
 
   /* ---------------------------------------------------------------- *
@@ -499,11 +533,10 @@ export class AdvisorEngine {
       const messages = await this.#host.listMessages(sessionID)
       state.streaming = streaming
 
-      // A new user message resets the per-turn steering cap.
+      // A new user message resets the per-turn blocker cap.
       const userMessages = messages.reduce((n, m) => (m.type === "user" ? n + 1 : n), 0)
       if (userMessages > state.userMessageCount) {
         state.userMessageCount = userMessages
-        state.steersSinceUser = 0
         state.blockersThisUserTurn = 0
       }
 
@@ -588,7 +621,7 @@ export class AdvisorEngine {
     streaming: boolean,
     state: SessionState,
   ): Promise<number> {
-    const model = await this.#host.resolveModel(advisor.model ?? this.#config.model)
+    const model = await this.#host.resolveModel(state.modelOverride ?? advisor.model ?? this.#config.model)
     state.lastModelWarning = model?.warning
     if (model?.warning) {
       const resolved = model.providerID + " at " + model.id
@@ -852,7 +885,6 @@ export class AdvisorEngine {
     guard: EmissionGuard,
   ): Promise<number> {
     if (notes.length === 0) return 0
-    const immuneActive = isImmuneActive(state, this.#config.immuneTurns)
 
     const admitted: { note: string; severity?: Severity; channel: DeliveryChannel }[] = []
     for (const note of notes) {
@@ -865,14 +897,7 @@ export class AdvisorEngine {
         this.#host.log("debug", "advisor nit dropped on a settled turn", { advisor: advisor.name })
         continue
       }
-      let channel = resolveChannel({
-        severity,
-        streaming,
-        interruptImmuneTurnActive: immuneActive,
-      })
-      // Safety net: past the per-turn cap, a would-be steer becomes a queued
-      // note, so the primary is never woken in an unbounded loop.
-      if (channel === "steer" && state.steersSinceUser >= MAX_STEERS_PER_USER_TURN) channel = "queue"
+      const channel = resolveChannel({ severity, streaming })
       // A third blocker inside one user turn is churn far more often than signal;
       // dropping it here keeps it out of the guard's history, so the turn-end
       // pass can still raise it if it survives.
@@ -896,7 +921,6 @@ export class AdvisorEngine {
     const groups: Record<DeliveryChannel, Note[]> = { steer: [], queue: [], preserve: [] }
     for (const entry of admitted) groups[entry.channel].push({ note: entry.note, severity: entry.severity })
 
-    let steered = false
     const injectGroup = async (channel: DeliveryChannel, group: Note[]) => {
       if (group.length === 0) return
       // The host promotes only `steer` items at a step boundary; a `queue` item
@@ -928,9 +952,8 @@ export class AdvisorEngine {
         id = await send(delivery)
       } catch (err) {
         // One flaky injection must not drop a whole pass's notes: a failed steer
-        // is retried queued (nothing interrupted the agent, so `steered` stays
-        // false and the immune window is untouched), a failed queue/preserve is
-        // logged and left unrouted so a later pass can raise it again.
+        // is retried queued, a failed queue/preserve is logged and left
+        // unrouted so a later pass can raise it again.
         if (channel !== "steer") {
           this.#host.log("warn", "advisor note was not delivered", { advisor: advisor.name, error: (err as Error).message })
           return
@@ -966,7 +989,6 @@ export class AdvisorEngine {
         }
       }
       for (const note of group) guard.markRouted(note.note)
-      if (channel === "steer" && delivery === "steer" && id) steered = true
     }
 
     const deliveredBefore = state.notesDelivered
@@ -995,8 +1017,6 @@ export class AdvisorEngine {
     for (const entry of admitted) prior.push(entry.note)
     state.priorNotes.set(advisor.slug, prior.slice(-PRIOR_NOTE_LIMIT))
 
-    if (steered) state.immuneTurnStart = state.completedTurns
-    if (groups.steer.length > 0) state.steersSinceUser += groups.steer.length
     state.blockersThisUserTurn += admitted.filter((entry) => entry.severity === "blocker").length
     return admitted.length
   }
@@ -1034,6 +1054,8 @@ export class AdvisorEngine {
     defaultEnabled: boolean
     /** The per-session override, when one was set; undefined means "use the default". */
     override?: boolean
+    /** The session's `/advisor model` selector, which beats every configured model. */
+    modelOverride?: string
     advisors: {
       name: string
       slug: string
@@ -1071,6 +1093,7 @@ export class AdvisorEngine {
       enabled,
       defaultEnabled: this.#config.enabled,
       override: state.enabled,
+      modelOverride: state.modelOverride,
       advisors: this.#config.advisors.map((a) => {
         const items = state.priorNotes.get(a.slug) ?? []
         return {
@@ -1116,11 +1139,6 @@ export class AdvisorEngine {
 function findLastIndex<T>(items: readonly T[], predicate: (item: T) => boolean): number {
   for (let i = items.length - 1; i >= 0; i--) if (predicate(items[i]!)) return i
   return -1
-}
-
-function isImmuneActive(state: SessionState, immuneTurns: number): boolean {
-  if (state.immuneTurnStart === undefined || immuneTurns <= 0) return false
-  return state.completedTurns < state.immuneTurnStart + immuneTurns
 }
 
 function normalizeKey(note: string): string {

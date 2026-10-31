@@ -219,8 +219,6 @@ export interface ChannelInput {
   severity: Severity | undefined
   /** A run is actively streaming right now. */
   streaming: boolean
-  /** Inside the post-interrupt immune window. */
-  interruptImmuneTurnActive: boolean
 }
 
 /**
@@ -233,13 +231,11 @@ export interface ChannelInput {
  * A `concern` or `blocker` steers, whether a turn is running or has already
  * settled: a finding about finished work is worth acting on now, not at the
  * next user message. A `nit` never wakes anyone — it queues mid-turn and is
- * preserved (then dropped by the engine) on a settled turn. Inside the
- * post-interrupt immune window nothing steers: mid-turn it queues, settled it
- * is preserved. One interruption stays one interruption, however it is
- * reworded; the engine's per-user-turn steer cap bounds the wake-ups.
+ * preserved (then dropped by the engine) on a settled turn. Nothing caps the
+ * wake-ups: the guard's duplicate and reworded-repeat suppression is what keeps
+ * one finding from waking the agent twice.
  */
 export function resolveChannel(input: ChannelInput): DeliveryChannel {
   if (input.severity === "nit" || input.severity === undefined) return input.streaming ? "queue" : "preserve"
-  if (input.interruptImmuneTurnActive) return input.streaming ? "queue" : "preserve"
   return "steer"
 }

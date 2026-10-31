@@ -28,12 +28,12 @@ and does not dedupe, so the plugin would load twice.
 | `scripts/mutate.ts` | mutation check: deliberate changes must be caught by the suite |
 | `plugin/transcript.ts` | session messages → one markdown delta |
 | `plugin/tools.ts` | `read` / `grep` / `glob`, executed by the plugin and jailed to the project directory |
-| `test/*.test.ts` | 160 tests, no network and no real model |
+| `test/*.test.ts` | 155 tests, no network and no real model |
 
 ## Commands
 
 ```bash
-bun test              # 160 tests
+bun test              # 155 tests
 bun run mutate       # 7 deliberate changes must each be caught by the suite
 bunx tsc --noEmit     # both must be green before any commit
 ```
@@ -73,8 +73,7 @@ bunx tsc --noEmit     # both must be green before any commit
   a `queue` item waits for the next run, i.e. the end of the turn. So the engine's
   mid-turn *queue channel* is sent as `delivery: "steer", resume: false` (lands after
   the current model call or tool round, wakes nobody), and only a settled-turn queue
-  or preserve note is sent as `delivery: "queue"`. The steer cap and immune window
-  count the routed channel, never the wire `delivery`.
+  or preserve note is sent as `delivery: "queue"`.
   A failed injection does not drop the pass: a steer is retried queued, a
   queue/preserve failure is logged and the note left *unrouted*, so a later pass can
   raise it again. Considered and rejected: post-hoc delivery verification against the
@@ -95,11 +94,14 @@ bunx tsc --noEmit     # both must be green before any commit
    (user's decision, 2026-10-15; this reverses `1e3ce05`'s never-wake rule). A `nit`
    never wakes: mid-turn it lands at the next step boundary (a non-resuming steer)
    and on a settled turn it is dropped (invariant 8).
-   Wake-ups are bounded: inside the immune window nothing steers (settled →
-   `preserve`), and past `MAX_STEERS_PER_USER_TURN` (4) a would-be steer is queued
-   with `resume: false`. (`guard.test.ts`, `"a settled session is woken only by a
-   concern or blocker"`; `engine.test.ts`, `"wake-ups on settled turns stop at the
-   per-turn steer cap"`.)
+   Every concern or blocker wakes; there is no immune window and no per-turn steer
+   cap (user's decision, 2026-10-31: the immune window restarted after every wake,
+   so the woken run's own review was routed `preserve` and the user had to wake the
+   agent by hand). Only the guard's duplicate and reworded-repeat suppression stops
+   one finding from waking the agent twice. (`guard.test.ts`, `"a settled session
+   is woken only by a concern or blocker"`; `engine.test.ts`, `"every settled
+   concern wakes the agent, however many came before"` and `"a woken turn that
+   ends still lets the next concern wake it"`.)
 2. **Advisories are never reviewed** — `isAdvisorMessage` filters them out of the delta.
 3. **Every review is bounded** — each pass sees the whole current turn (a one-step
    slice is partial evidence, and partial evidence produces false claims), notes are

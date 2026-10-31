@@ -127,13 +127,12 @@ describe("resolveConfig", () => {
 
   test("inline options replace the discovered roster and honor the master switch", async () => {
     const config = await resolveConfig(
-      { enabled: true, advisors: [{ name: "Inline", tools: [] }], immuneTurns: 5 },
+      { enabled: true, advisors: [{ name: "Inline", tools: [] }] },
       cwd,
       configDir,
     )
     expect(config.advisors.map((a) => a.name)).toEqual(["Inline"])
     expect(config.advisors[0]!.tools).toEqual([])
-    expect(config.immuneTurns).toBe(5)
   })
 
   test("defaults to disabled", async () => {
@@ -141,7 +140,6 @@ describe("resolveConfig", () => {
     try {
       const config = await resolveConfig({}, empty, empty)
       expect(config.enabled).toBe(false)
-      expect(config.immuneTurns).toBe(3)
       // Prompt size drives reviewer latency, so the delta cap and the deadline
       // are chosen together (see the comment in resolveConfig).
       expect(config.maxTranscriptChars).toBe(30_000)
