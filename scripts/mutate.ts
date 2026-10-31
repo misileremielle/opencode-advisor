@@ -48,7 +48,7 @@ const MUTATIONS: Mutation[] = [
   {
     name: "a queued note may resume the agent (only steers may wake)",
     file: "plugin/engine.ts",
-    find: 'resume: to === "steer",',
+    find: 'resume: to === "steer" && channel === "steer",',
     replace: "resume: true,",
   },
   {

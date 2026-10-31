@@ -899,9 +899,12 @@ export class AdvisorEngine {
     let steered = false
     const injectGroup = async (channel: DeliveryChannel, group: Note[]) => {
       if (group.length === 0) return
-      const delivery: "steer" | "queue" = channel === "steer" ? "steer" : "queue"
-      // Only a steering note may wake an idle agent. A queued note rides the
-      // running turn (streaming) or waits; a preserve note is a visible card.
+      // The host promotes only `steer` items at a step boundary; a `queue` item
+      // waits for the next run, i.e. the end of the turn. So a mid-turn queued
+      // note goes out as a steer without `resume`: it lands after the current
+      // model call or tool round and never wakes an idle agent. Only a steering
+      // note resumes; a preserve note waits for the next turn.
+      const delivery: "steer" | "queue" = channel === "steer" || (channel === "queue" && streaming) ? "steer" : "queue"
       // After the primary has answered, omp prefaces the batch with its
       // boundary guidance: first time, then at most once every 50 turns.
       const boundary =
@@ -916,7 +919,7 @@ export class AdvisorEngine {
           description: channel === "preserve" ? "advisor note" : "advisor",
           metadata: { advisor: { slug: advisor.slug, name: advisor.name, severities: group.map((n) => n.severity ?? "nit"), instance: this.#host.instance, raisedAt: Date.now() } },
           delivery: to,
-          resume: to === "steer",
+          resume: to === "steer" && channel === "steer",
         })
       }
       let id: string | undefined

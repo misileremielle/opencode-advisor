@@ -69,7 +69,12 @@ bunx tsc --noEmit     # both must be green before any commit
   anyway", never a silently disabled reviewer.
 - **Delivery is `ctx.session.synthetic`** with `delivery: "steer" | "queue"` and
   `resume`. Notes carry `metadata.advisor`, and `isAdvisorMessage` makes the reviewer
-  ignore its own output.
+  ignore its own output. The host promotes only `steer` items at a step boundary;
+  a `queue` item waits for the next run, i.e. the end of the turn. So the engine's
+  mid-turn *queue channel* is sent as `delivery: "steer", resume: false` (lands after
+  the current model call or tool round, wakes nobody), and only a settled-turn queue
+  or preserve note is sent as `delivery: "queue"`. The steer cap and immune window
+  count the routed channel, never the wire `delivery`.
   A failed injection does not drop the pass: a steer is retried queued, a
   queue/preserve failure is logged and the note left *unrouted*, so a later pass can
   raise it again. Considered and rejected: post-hoc delivery verification against the
@@ -88,7 +93,8 @@ bunx tsc --noEmit     # both must be green before any commit
    with `resume: true` whether the turn is running or settled, so a finding about
    finished work restarts the agent instead of waiting for the next user message
    (user's decision, 2026-10-15; this reverses `1e3ce05`'s never-wake rule). A `nit`
-   never wakes: it queues mid-turn and is dropped on a settled turn (invariant 8).
+   never wakes: mid-turn it lands at the next step boundary (a non-resuming steer)
+   and on a settled turn it is dropped (invariant 8).
    Wake-ups are bounded: inside the immune window nothing steers (settled →
    `preserve`), and past `MAX_STEERS_PER_USER_TURN` (4) a would-be steer is queued
    with `resume: false`. (`guard.test.ts`, `"a settled session is woken only by a

@@ -701,6 +701,74 @@ describe("AdvisorEngine", () => {
     engine.dispose()
   })
 
+  // The host promotes only `steer` items at a step boundary; `queue` items wait
+  // for the next run, i.e. the end of the turn. A non-waking note mid-turn must
+  // therefore go out as a steer without `resume`.
+  test("a mid-turn nit lands at the next step boundary without waking", async () => {
+    const host = makeHost("/repo", [user, midwork])
+    host.responses.push('{"notes":[{"severity":"nit","note":"Prefer const here"}]}')
+    const engine = new TestEngine(makeConfig(), host)
+
+    await engine.review("s1", true)
+
+    expect(host.injections).toHaveLength(1)
+    expect(host.injections[0]!.delivery).toBe("steer")
+    expect(host.injections[0]!.resume).toBe(false)
+    engine.dispose()
+  })
+
+  test("past the steer cap, a mid-turn concern still lands at the next step boundary", async () => {
+    const transcript: SessionMessage[] = [user, midwork]
+    const host = makeHost("/repo", transcript)
+    const findings = [
+      "The retry loop in fetch.ts never backs off",
+      "config.ts reads PORT before dotenv loads",
+      "Migration 7 drops the users index",
+      "The cache key ignores the locale header",
+      "Logger writes secrets from the auth payload",
+    ]
+    for (const note of findings) host.responses.push(JSON.stringify({ notes: [{ severity: "concern", note }] }))
+    const engine = new TestEngine(makeConfig({ immuneTurns: 0 }), host)
+
+    for (let i = 0; i < findings.length; i++) {
+      await engine.review("s1", true)
+      transcript.push({ ...midwork, id: `w${i}` })
+    }
+
+    expect(host.injections).toHaveLength(5)
+    expect(host.injections.filter((inj) => inj.resume)).toHaveLength(4)
+    expect(host.injections[4]!.delivery).toBe("steer")
+    expect(host.injections[4]!.resume).toBe(false)
+    engine.dispose()
+  })
+
+  test("mid-turn nits do not spend the wake-ups of a later settled concern", async () => {
+    const transcript: SessionMessage[] = [user, midwork]
+    const host = makeHost("/repo", transcript)
+    const nits = [
+      "Prefer const in fetch.ts",
+      "Rename tmp in config.ts",
+      "Drop the unused import in cache.ts",
+      "Trailing comma in logger.ts",
+      "Typo in the migration comment",
+    ]
+    for (const note of nits) host.responses.push(JSON.stringify({ notes: [{ severity: "nit", note }] }))
+    host.responses.push('{"notes":[{"severity":"concern","note":"The port is wrong"}]}')
+    const engine = new TestEngine(makeConfig({ immuneTurns: 0 }), host)
+
+    for (let i = 0; i < nits.length; i++) {
+      await engine.review("s1", true)
+      transcript.push({ ...midwork, id: `w${i}` })
+    }
+    transcript.push(terminal)
+    await engine.review("s1", false)
+
+    expect(host.injections).toHaveLength(nits.length + 1)
+    expect(host.injections.at(-1)!.delivery).toBe("steer")
+    expect(host.injections.at(-1)!.resume).toBe(true)
+    engine.dispose()
+  })
+
   test("a steered note on an already-answered turn asks for a restatement", async () => {
     const host = makeHost("/repo", [user, terminal])
     host.responses.push('{"notes":[{"severity":"concern","note":"The port is wrong"}]}')
